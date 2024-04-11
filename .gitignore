@@ -1,0 +1,6 @@
+.DS_Store
+.vscode
+Cargo.lock
+/target
+tmp
+*.db3

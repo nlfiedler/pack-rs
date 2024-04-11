@@ -1,0 +1,62 @@
+* Action Items
+** TODO find a file by its path and print it
+*** see =Result= in =IndexedItemsSQLite3SQLStatement= in =UPackDraft0Shared.pas= in Pack
+** TODO extract all files from the archive, creating directories as needed
+*** consider how this can be done quickly and efficiently
+*** create a zero-length file on restore if the item has no =itemcontent= rows
+*** unix: ignore the leading =/= or =..= for absolute paths
+*** windows: ignore leading drive letter specifier
+** TODO size content bundles dynamically
+*** based on the number of incoming files
+*** will need to experiment with different data sets to find appropriate sizes
+** TODO process content bundles concurrently
+*** determine if SQLite is thread-safe and how to use =rusqlite= concurrently
+**** SQLite can be thread-safe in ~multi-thread~ or ~serialized~ modes
+**** =rusqlite= will ensure SQLite is in thread-safe mode
+*** each thread needs to have its own =Connection= instance
+*** build a queue of content bundles by scanning file tree and producing sets of content bundle parameters
+*** threads take parameters, read files, combine into a bundle, compress, insert ~content~ and ~itemcontent~ rows
+** TODO set database page size according to size of input set
+*** if more than =1mb=, page size is =4096=, otherwise =512=
+*** add a =new_with_page_size()= function or similar
+** TODO unpack the archive using concurrent threads
+** TODO consider optionally compressing the content bundles
+*** if compression does not make the bundle smaller, then store as-is
+*** add column to =content= table that indicates if the blob is compressed or not
+**** the =zstd= API lacks a means of detecting if data is compressed or not
+** TODO validate the pack file when opening
+** TODO add a file to an existing archive
+*** should look up the full path and ensure parents exist
+*** if an existing entry matches the full path, create a new ~content~ row and replace its ~itemcontent~ rows
+**** that is, leave any existing ~content~ row alone (it may contain other files)
+**** add a new ~content~ row for this new file
+**** remove any ~itemcontent~ rows for this particular item
+**** add new ~itemcontent~ rows for this new file
+** TODO remove a file from an existing archive
+** TODO support includes/excludes when building archive
+** TODO support includes/excludes when extracting archive
+** TODO optionally store file times, owners, permissions in separate table
+*** ~attrs~ table
+| column | type    | description                 |
+|--------+---------+-----------------------------|
+| item   | integer | foreign key to ~item~ table |
+| mode   | integer | Unix file mode              |
+| attrs  | integer | Windows file attributes     |
+| mtime  | integer | modified time               |
+| ctime  | integer | creation time               |
+| atime  | integer | accessed time               |
+| user   | text    | user name                   |
+| uid    | integer | user identifier             |
+| group  | text    | group name                  |
+| gid    | integer | group identifier            |
+*** SQLite supports date/time with multiple storage classes and related functions
+**** use the =INTEGER= storage class and store as Unix time
+** TODO optionally store extended attributes in separate table
+*** ~xattrs~ table
+| column | type    | description                 |
+|--------+---------+-----------------------------|
+| item   | integer | foreign key to ~item~ table |
+| name   | text    | name of extended attribute  |
+| value  | blob    | extended attribute bytes    |
+** library development plan
+*** enable creating the database in memory for unit testing purposes

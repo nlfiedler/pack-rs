@@ -1,0 +1,15 @@
+[package]
+name = "pack-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nathan Fiedler <nathanfiedler@fastmail.fm>"]
+description = "Archiver/compressor using SQLite and Zstandard."
+repository = "https://github.com/nlfiedler/pack-rs"
+readme = "README.md"
+keywords = ["archiver", "compressor"]
+license = "MIT"
+
+[dependencies]
+rusqlite = { version = "0.31.0", features = ["blob"] }
+thiserror = "1.0.58"
+zstd = "0.13.1"
