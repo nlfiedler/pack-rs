@@ -37,7 +37,7 @@ Rows in the `item` table represent both directories and files. The `kind` for di
 
 ### content
 
-Rows in the `content` table are nothing more than huge blobs of compressed data that contain the file data within the archive. The size of these blobs can vary, anywhere from 8 to 32 MiB (mebibytes) with the idea being that larger blocks of continguous content will compress better.
+Rows in the `content` table are nothing more than huge blobs of compressed data that contain the file data within the archive. The size of these blobs can vary, anywhere from 8 to 32 MiB (mebibytes) with the idea being that larger blocks of contiguous content will compress better.
 
 | Name     | Type                  | Description               |
 | -------- | --------------------- | ------------------------- |
@@ -50,7 +50,7 @@ The content blobs are built up from the contents of as many files as it takes to
 
 The `itemcontent` table is the glue that binds the rows from the `item` table to the huge blobs in the `content` table. Typically a blob is large enough to hold many files, as such this table will show which blob contains the data for a particular file, and where within the (decompressed) blob to read the data.
 
-For very large files that are larger than the blob size, they will reference multiple rows from the `content` table. The `itempos` and `contentpos` values make it possible to accomodate both small files that fit within a blob and large files that do not.
+For very large files that are larger than the blob size, they will reference multiple rows from the `content` table. The `itempos` and `contentpos` values make it possible to accommodate both small files that fit within a blob and large files that do not.
 
 | Name         | Type                  | Description               |
 | ------------ | --------------------- | ------------------------- |
