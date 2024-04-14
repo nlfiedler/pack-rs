@@ -1,6 +1,6 @@
 # pack-rs
 
-An experiment to make something like [Pack](https://pack.ac) using [Rust](https://www.rust-lang.org). Pack is an archiver/compressor that takes a novel approach to the problem that has largely been dominated by two formats for the past couple of decades, tar/gz and zip. Original idea by [O](https://github.com/OttoCoddo) with an implementation in [Pascal](https://github.com/PackOrganization/Pack) and a lot of very clever SQL.
+An on-going effort to make something like [Pack](https://pack.ac) using [Rust](https://www.rust-lang.org). Pack is an archiver/compressor that takes a novel approach to the problem that has largely been dominated by two formats for the past couple of decades, tar/gz and zip. Original idea by [O](https://github.com/OttoCoddo) with an implementation in [Pascal](https://github.com/PackOrganization/Pack) and some very clever SQL.
 
 ## Objectives
 
@@ -16,9 +16,9 @@ Short term features:
 * Support include/exclude patterns when building or extracting an archive.
 * Store symbolic links (currently ignored).
 
-Long term, additional features would be nice-to-have:
+In the long term, there are additional features that would be nice-to-have:
 
-* Optional compression of a pack with any available algorithm, not just Zstandard. Currently, the Rust `zstd` crate lacks a nice way of detecting if a block of data is compressed using Zstandard. What's more, it would be ideal to future-proof the design by allowing an implementation to use any compression algorithm. Likely would add a `TEXT` column to the `content` table that specifies the compression algorithm used (e.g. `7zip`).
+* Optional compression of a pack using any available algorithm, not just Zstandard. Currently, the Rust `zstd` crate lacks a nice way of detecting if a block of data is compressed using Zstandard. What's more, it would be ideal to future-proof the design by allowing an implementation to use any compression algorithm. Likely would add a `TEXT` column to the `content` table that specifies the compression algorithm used (e.g. `7zip`).
 * Support encryption of the content blobs (will require compression, probably involve a salt value stored in the `content` table).
 * Optionally store file metadata (owners, permissions, etc) in a separate table.
 * Optionally store file extended attributes in a separate table.
@@ -29,7 +29,7 @@ Long term, additional features would be nice-to-have:
 
 * [Rust](https://www.rust-lang.org) 2021 edition
 
-### Instructions
+### Running the tests
 
 For the time being there are very few unit tests.
 
@@ -37,7 +37,39 @@ For the time being there are very few unit tests.
 cargo test
 ```
 
-Invoking `cargo run` will attempt to read from a directory that you will almost certainly not have on your system, resulting in an error. For now, modify `main.rs` to read from a suitable location when building the archive. This will be fixed very soon.
+### Creating, listing, extracting archives
+
+Start by creating an archive using the `create` subcommand. The example below assumes that you have downloaded something interesting into your `~/Downloads` directory.
+
+```shell
+$ cargo run -- create pack.db3 ~/Downloads/httpd-2.4.59
+...
+Added 3138 files to pack.db3
+```
+
+Now that the `pack.db3` file exists, you can list the contents like so:
+
+```shell
+$ cargo run -- list pack.db3 | head -20
+...
+httpd-2.4.59/.deps
+httpd-2.4.59/.gdbinit
+httpd-2.4.59/.gitignore
+httpd-2.4.59/ABOUT_APACHE
+httpd-2.4.59/Apache-apr2.dsw
+httpd-2.4.59/Apache.dsw
+httpd-2.4.59/BuildAll.dsp
+httpd-2.4.59/BuildBin.dsp
+...
+```
+
+Finally, to extract the contents of the archive into the current directory:
+
+```shell
+$ cargo run -- extract pack.db3
+...
+Extracted 3138 files from pack.db3
+```
 
 ## Specification
 
@@ -72,6 +104,8 @@ The content blobs are built up from the contents of as many files as it takes to
 The `itemcontent` table is the glue that binds the rows from the `item` table to the huge blobs in the `content` table. Typically a blob is large enough to hold many files, as such this table will show which blob contains the data for a particular file, and where within the (decompressed) blob to read the data.
 
 For very large files that are larger than the blob size, they will reference multiple rows from the `content` table. The `itempos` and `contentpos` values make it possible to accommodate both small files that fit within a blob and large files that do not.
+
+**Note:** empty files will have a row in the `itemcontent` table with a `size` of zero to make it easier to write the extraction implementation.
 
 | Name         | Type                  | Description               |
 | ------------ | --------------------- | ------------------------- |

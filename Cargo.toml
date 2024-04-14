@@ -10,6 +10,7 @@ keywords = ["archiver", "compressor"]
 license = "MIT"
 
 [dependencies]
+clap = "4.5.4"
 rusqlite = { version = "0.31.0", features = ["blob"] }
 thiserror = "1.0.58"
 zstd = "0.13.1"

@@ -1,6 +1,9 @@
 //
 // Copyright (c) 2024 Nathan Fiedler
 //
+use rusqlite::Connection;
+use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 ///
@@ -17,6 +20,40 @@ pub enum Error {
     /// When writing file content to a blob, the result was incomplete.
     #[error("could not write entire file part to blob")]
     IncompleteBlobWrite,
+    /// The named pack file was not one of ours.
+    #[error("pack file format not recognized")]
+    NotPackFile,
+}
+
+// Expected SQLite database header: "SQLite format 3\0"
+static SQL_HEADER: &'static [u8] = &[
+    0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00,
+];
+
+///
+/// Return `true` if the path refers to a pack file, false otherwise.
+///
+pub fn is_pack_file<P: AsRef<Path>>(path: P) -> Result<bool, Error> {
+    let metadata = fs::metadata(path.as_ref())?;
+    if metadata.is_file() && metadata.len() > 16 {
+        let mut file = fs::File::open(path.as_ref())?;
+        let mut buffer = [0; 16];
+        file.read_exact(&mut buffer)?;
+        if buffer == SQL_HEADER {
+            // open and check for non-zero amount of data
+            let conn = Connection::open(path.as_ref())?;
+            match conn.prepare("SELECT * FROM item") {
+                Ok(mut stmt) => {
+                    let result = stmt.exists([])?;
+                    return Ok(result);
+                }
+                Err(_) => {
+                    return Ok(false);
+                }
+            };
+        }
+    }
+    Ok(false)
 }
 
 ///
@@ -39,6 +76,14 @@ pub fn sanitize_path<P: AsRef<Path>>(dirty: P) -> Result<PathBuf, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_pack_file() -> Result<(), Error> {
+        assert!(!is_pack_file("test/fixtures/empty-file")?);
+        assert!(!is_pack_file("test/fixtures/notpack.db3")?);
+        assert!(is_pack_file("test/fixtures/pack.db3")?);
+        Ok(())
+    }
 
     #[test]
     fn test_sanitize_path() -> Result<(), Error> {

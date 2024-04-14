@@ -1,16 +1,16 @@
 //
 // Copyright (c) 2024 Nathan Fiedler
 //
+use clap::{arg, Command};
+use pack_rs::Error;
 use rusqlite::blob::ZeroBlob;
 use rusqlite::{Connection, DatabaseName};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::{fs, vec};
 
-use pack_rs::Error;
-
-const KIND_FILE: i8 = 0;
-const KIND_DIRECTORY: i8 = 1;
+const KIND_FILE: i64 = 0;
+const KIND_DIRECTORY: i64 = 1;
 const BUNDLE_SIZE: u64 = 16777216;
 
 //
@@ -287,6 +287,32 @@ impl PackBuilder {
 }
 
 ///
+/// Create a pack file at the given location and add all of the named inputs.
+///
+/// Returns the total number of files added to the archive.
+///
+fn create_archive<P: AsRef<Path>>(pack: P, inputs: Vec<&PathBuf>) -> Result<u64, Error> {
+    let path_ref = pack.as_ref();
+    let path = match path_ref.extension() {
+        Some(_) => path_ref.to_path_buf(),
+        None => path_ref.with_extension("db3"),
+    };
+    let mut builder = PackBuilder::new(path)?;
+    let mut file_count: u64 = 0;
+    for input in inputs {
+        let metadata = input.metadata()?;
+        if metadata.is_dir() {
+            file_count += builder.add_dir_all(input)?;
+        } else if metadata.is_file() {
+            builder.add_file(input, 0)?;
+            file_count += 1;
+        }
+    }
+    builder.finish()?;
+    Ok(file_count)
+}
+
+///
 /// Return the last part of the path, converting to a String.
 ///
 fn get_file_name<P: AsRef<Path>>(path: P) -> String {
@@ -323,7 +349,6 @@ impl PackReader {
     ///
     /// Directory entries have a path that ends with a slash (/).
     ///
-    #[allow(dead_code)]
     fn entries(&self) -> Result<Vec<Result<Entry, rusqlite::Error>>, Error> {
         //
         // Would love to return an iterator but that is quite difficult given
@@ -381,6 +406,7 @@ SELECT id, parent, kind, Path FROM FIT;";
         // process the item blobs from the resulting itemcontent query
         let mut content_id: i64 = -1;
         let mut files: Vec<IndexedFile> = vec![];
+        let mut file_count: u64 = 0;
         while let Some(row_result) = item_iter.next() {
             let indexed_file = row_result?;
             if indexed_file.content != content_id {
@@ -390,7 +416,7 @@ SELECT id, parent, kind, Path FROM FIT;";
                     files.push(indexed_file);
                 } else {
                     // reached the end of the entries for this content
-                    self.process_content(files)?;
+                    file_count += self.process_content(files)?;
                     files = Vec::new();
                     content_id = -1;
                 }
@@ -401,16 +427,16 @@ SELECT id, parent, kind, Path FROM FIT;";
         }
         // make sure any remaining content is processed
         if !files.is_empty() {
-            self.process_content(files)?;
+            file_count += self.process_content(files)?;
         }
 
         // clean up
         self.drop_temp_paths_table()?;
-        Ok(0)
+        Ok(file_count)
     }
 
     // Process a single content blob and all of the files it contains.
-    fn process_content(&self, files: Vec<IndexedFile>) -> Result<(), Error> {
+    fn process_content(&self, files: Vec<IndexedFile>) -> Result<u64, Error> {
         assert!(!files.is_empty(), "expected files to be non-empty");
         let content_id = files[0].content;
 
@@ -422,6 +448,7 @@ SELECT id, parent, kind, Path FROM FIT;";
         zstd::stream::copy_decode(&mut blob, &mut buffer)?;
 
         // process each of the rows of content, which are portions of a file
+        let mut file_count: u64 = 0;
         for entry in files.iter() {
             // perform basic sanitization of the file path to prevent abuse (it
             // is theoretically possible that the data could produce a path with
@@ -436,11 +463,15 @@ SELECT id, parent, kind, Path FROM FIT;";
                 .write(true)
                 .create(true)
                 .open(&fpath)?;
+            let file_len = fs::metadata(fpath)?.len();
+            if file_len == 0 {
+                // just created a new file, count it
+                file_count += 1;
+            }
             // if the file was an empty file, then we are already done here
             if entry.size > 0 {
                 // ensure the file has the appropriate length for writing this
                 // content chunk into the file, extending it as necessary
-                let file_len = fs::metadata(fpath)?.len();
                 if file_len < entry.itempos {
                     output.set_len(entry.itempos)?;
                 }
@@ -456,7 +487,7 @@ SELECT id, parent, kind, Path FROM FIT;";
             }
         }
 
-        Ok(())
+        Ok(file_count)
     }
 
     // Create a table to hold the item identifiers and their full paths and
@@ -564,6 +595,36 @@ LEFT JOIN ITI AS P ON C.FID = P.FID AND C.Parent = P.ID ORDER BY C.I;",
 }
 
 ///
+/// List all file entries in the archive in breadth-first order.
+///
+fn list_contents(pack: &str) -> Result<(), Error> {
+    if !pack_rs::is_pack_file(pack)? {
+        return Err(Error::NotPackFile);
+    }
+    let reader = PackReader::new(pack)?;
+    let entries = reader.entries()?;
+    for result in entries {
+        let entry = result?;
+        if entry.kind == KIND_FILE {
+            println!("{}", entry.name)
+        }
+    }
+    Ok(())
+}
+
+///
+/// Extract all of the files from the archive.
+///
+fn extract_contents(pack: &str) -> Result<u64, Error> {
+    if !pack_rs::is_pack_file(pack)? {
+        return Err(Error::NotPackFile);
+    }
+    let reader = PackReader::new(pack)?;
+    let file_count = reader.extract_all()?;
+    Ok(file_count)
+}
+
+///
 /// `Entry` represents a row from the `item` table.
 ///
 #[derive(Clone, Debug)]
@@ -592,27 +653,70 @@ struct OutgoingContent {
     size: u64,
 }
 
+fn cli() -> Command {
+    Command::new("pack-rs")
+        .about("Archiver/compressor")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(
+            Command::new("create")
+                .about("Creates an archive from a set of files.")
+                .short_flag('c')
+                .arg(arg!(pack: <PACK> "File path to which the archive will be written."))
+                .arg(
+                    arg!(<INPUTS> ... "Files to add to archive")
+                        .value_parser(clap::value_parser!(PathBuf)),
+                )
+                .arg_required_else_help(true),
+        )
+        .subcommand(
+            Command::new("list")
+                .about("Lists the contents of an archive.")
+                .short_flag('l')
+                .arg(arg!(pack: <PACK> "File path specifying the archive to read from."))
+                .arg_required_else_help(true),
+        )
+        .subcommand(
+            Command::new("extract")
+                .about("Extracts one or more files from an archive.")
+                .short_flag('x')
+                .arg(arg!(pack: <PACK> "File path specifying the archive to read from."))
+                .arg_required_else_help(true),
+        )
+}
+
 fn main() -> Result<(), Error> {
-    let path = "./pack.db3";
-    let inpath = Path::new("/Users/nfiedler/Downloads/httpd-2.4.59/modules/arch");
-    let mut builder = PackBuilder::new(path)?;
-    let file_count = builder.add_dir_all(inpath)?;
-    builder.finish()?;
-    println!("added {} files", file_count);
-
-    // list all entries in the archive in breadth-first order
-    // let reader = PackReader::new(path)?;
-    // let entries = reader.entries()?;
-    // for entry in entries {
-    //     println!("entry: {:?}", entry)
-    // }
-
-    // find a particular file by its path and print it
-    // let file_id = reader.find_file_by_path("arch/win32/Makefile.in")?;
-    // reader.print_file(file_id)?;
-
-    // extract all of the files in the archive
-    let reader = PackReader::new(path)?;
-    reader.extract_all()?;
+    let matches = cli().get_matches();
+    match matches.subcommand() {
+        Some(("create", sub_matches)) => {
+            let pack = sub_matches
+                .get_one::<String>("pack")
+                .map(|s| s.as_str())
+                .unwrap_or("pack.db3");
+            let inputs = sub_matches
+                .get_many::<PathBuf>("INPUTS")
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            let file_count = create_archive(pack, inputs)?;
+            println!("Added {} files to {}", file_count, pack);
+        }
+        Some(("list", sub_matches)) => {
+            let pack = sub_matches
+                .get_one::<String>("pack")
+                .map(|s| s.as_str())
+                .unwrap_or("pack.db3");
+            list_contents(pack)?;
+        }
+        Some(("extract", sub_matches)) => {
+            let pack = sub_matches
+                .get_one::<String>("pack")
+                .map(|s| s.as_str())
+                .unwrap_or("pack.db3");
+            let file_count = extract_contents(pack)?;
+            println!("Extracted {} files from {}", file_count, pack)
+        }
+        _ => unreachable!(),
+    }
     Ok(())
 }
