@@ -3,28 +3,14 @@
 //
 use rusqlite::blob::ZeroBlob;
 use rusqlite::{Connection, DatabaseName};
-use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::{fs, vec};
 
-///
-/// This type represents all possible errors that can occur within this crate.
-///
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    /// Error occurred during an I/O related operation.
-    #[error("I/O error: {0}")]
-    IOError(#[from] std::io::Error),
-    /// Error occurred during an SQL related operation.
-    #[error("SQL error: {0}")]
-    SQLError(#[from] rusqlite::Error),
-    /// When writing file content to a blob, the result was incomplete.
-    #[error("could not write entire file part to blob")]
-    IncompleteBlobWrite,
-}
+use pack_rs::Error;
 
-const KIND_DIRECTORY: i8 = 0;
-const KIND_FILE: i8 = 1;
+const KIND_FILE: i8 = 0;
+const KIND_DIRECTORY: i8 = 1;
 const BUNDLE_SIZE: u64 = 16777216;
 
 //
@@ -190,10 +176,12 @@ impl PackBuilder {
             Ok(attr) => attr.len(),
             Err(_) => 0,
         };
-        // empty files will not result in any new itemcontent rows
+        // empty files will result in a an itemcontent row whose size is zero,
+        // allowing for the extraction process to know to create an empty file
+        // (otherwise it is difficult to tell from the available data)
         let mut itempos: u64 = 0;
         let mut size: u64 = file_len;
-        while size > 0 {
+        loop {
             if self.bundle.current_pos + size > BUNDLE_SIZE {
                 let remainder = BUNDLE_SIZE - self.bundle.current_pos;
                 // add a portion of the file to fill the bundle
@@ -223,7 +211,7 @@ impl PackBuilder {
                 };
                 self.bundle.contents.push(content);
                 self.bundle.current_pos += size;
-                size = 0;
+                break;
             }
         }
         Ok(item_id)
@@ -331,8 +319,11 @@ impl PackReader {
     }
 
     ///
-    /// Return all items in the archive.
+    /// Return all items in the archive with the `name` as the full path.
     ///
+    /// Directory entries have a path that ends with a slash (/).
+    ///
+    #[allow(dead_code)]
     fn entries(&self) -> Result<Vec<Result<Entry, rusqlite::Error>>, Error> {
         //
         // Would love to return an iterator but that is quite difficult given
@@ -341,28 +332,204 @@ impl PackReader {
         // Query from Pack in UPackDraft0Shared.pas that queries all items in
         // ascending order to make it easy to build the results.
         //
-        let query = "WITH IT AS (SELECT * FROM Item),
-            ITI AS (SELECT (ROW_NUMBER() OVER (ORDER BY ID) - 1) AS I, * FROM IT)
-            SELECT C.I, IFNULL(P.I, -1) AS PI, C.ID, C.Parent, C.Kind, C.Name FROM ITI AS C
-            LEFT JOIN ITI AS P ON C.Parent = P.ID ORDER BY C.I";
+        let query = "WITH RECURSIVE FIT AS (
+    SELECT *, Name || IIF(Kind = 1, '/', '') AS Path FROM Item WHERE Parent = 0
+    UNION ALL
+    SELECT Item.*, FIT.Path || Item.Name || IIF(Item.Kind = 1, '/', '') AS Path
+        FROM Item INNER JOIN FIT ON FIT.Kind = 1 AND Item.Parent = FIT.ID
+)
+SELECT id, parent, kind, Path FROM FIT;";
         let mut stmt = self.conn.prepare(query)?;
         let items: Vec<Result<Entry, rusqlite::Error>> = stmt
             .query_map([], |row| {
-                // rows: 0: I, 1: PI, 2: id, 3: parent, 4: kind, 5: name
                 Ok(Entry {
-                    id: row.get(2)?,
-                    parent: row.get(3)?,
-                    kind: row.get(4)?,
-                    name: row.get(5)?,
+                    id: row.get(0)?,
+                    parent: row.get(1)?,
+                    kind: row.get(2)?,
+                    name: row.get(3)?,
                 })
             })?
             .collect();
         Ok(items)
     }
 
+    // Returns the number of files extracted.
+    fn extract_all(&self) -> Result<u64, Error> {
+        // create a temporary table for holding the items and their full paths;
+        // start by dropping the table in case it was left behind from a
+        // previous operation
+        self.drop_temp_paths_table()?;
+        self.create_temp_paths_table()?;
+
+        // join the item paths with the itemcontent rows and sort by the content
+        // blob order, making it easier to efficiently process the content blobs
+        let mut stmt = self.conn.prepare(
+            "SELECT content, contentpos, itempos, Size, Path FROM IndexedFiles
+            LEFT JOIN itemcontent ON IndexedFiles.II = ItemContent.Item
+            ORDER BY content, contentpos",
+        )?;
+        let mut item_iter = stmt.query_map([], |row| {
+            Ok(IndexedFile {
+                content: row.get(0)?,
+                contentpos: row.get(1)?,
+                itempos: row.get(2)?,
+                size: row.get(3)?,
+                path: row.get(4)?,
+            })
+        })?;
+
+        // process the item blobs from the resulting itemcontent query
+        let mut content_id: i64 = -1;
+        let mut files: Vec<IndexedFile> = vec![];
+        while let Some(row_result) = item_iter.next() {
+            let indexed_file = row_result?;
+            if indexed_file.content != content_id {
+                if files.is_empty() {
+                    // first time we are processing this particular content
+                    content_id = indexed_file.content;
+                    files.push(indexed_file);
+                } else {
+                    // reached the end of the entries for this content
+                    self.process_content(files)?;
+                    files = Vec::new();
+                    content_id = -1;
+                }
+            } else {
+                // another piece of the content, add to the list
+                files.push(indexed_file);
+            }
+        }
+        // make sure any remaining content is processed
+        if !files.is_empty() {
+            self.process_content(files)?;
+        }
+
+        // clean up
+        self.drop_temp_paths_table()?;
+        Ok(0)
+    }
+
+    // Process a single content blob and all of the files it contains.
+    fn process_content(&self, files: Vec<IndexedFile>) -> Result<(), Error> {
+        assert!(!files.is_empty(), "expected files to be non-empty");
+        let content_id = files[0].content;
+
+        // fetch the blob and decompress
+        let mut blob =
+            self.conn
+                .blob_open(DatabaseName::Main, "content", "value", content_id, true)?;
+        let mut buffer: Vec<u8> = Vec::new();
+        zstd::stream::copy_decode(&mut blob, &mut buffer)?;
+
+        // process each of the rows of content, which are portions of a file
+        for entry in files.iter() {
+            // perform basic sanitization of the file path to prevent abuse (it
+            // is theoretically possible that the data could produce a path with
+            // a root, prefix, parent-dir elements)
+            let fpath = pack_rs::sanitize_path(&entry.path)?;
+            // create the directory to hold the file
+            if let Some(parent) = fpath.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            // make sure the file exists and is writable
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(&fpath)?;
+            // if the file was an empty file, then we are already done here
+            if entry.size > 0 {
+                // ensure the file has the appropriate length for writing this
+                // content chunk into the file, extending it as necessary
+                let file_len = fs::metadata(fpath)?.len();
+                if file_len < entry.itempos {
+                    output.set_len(entry.itempos)?;
+                }
+                // seek to the correct position within the file for this chunk
+                if entry.itempos > 0 {
+                    output.seek(SeekFrom::Start(entry.itempos))?;
+                }
+                // use Cursor because that's seemingly easier than getting a slice
+                let mut cursor = std::io::Cursor::new(&buffer);
+                cursor.seek(SeekFrom::Start(entry.contentpos))?;
+                let mut chunk = cursor.take(entry.size);
+                io::copy(&mut chunk, &mut output)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    // Create a table to hold the item identifiers and their full paths and
+    // populate it using the values in the item table.
+    fn create_temp_paths_table(&self) -> Result<(), Error> {
+        self.conn.execute(
+            "CREATE TEMPORARY TABLE IndexedFiles (II INTEGER PRIMARY KEY, Path)",
+            (),
+        )?;
+        self.conn.execute(
+            "INSERT INTO IndexedFiles SELECT II, Path FROM (
+                WITH RECURSIVE FIT AS (
+                    SELECT *, Name || IIF(Kind = 1, '/', '') AS Path FROM Item WHERE Parent = 0
+                    UNION ALL
+                    SELECT Item.*, FIT.Path || Item.Name || IIF(Item.Kind = 1, '/', '') AS Path
+                        FROM Item INNER JOIN FIT ON FIT.Kind = 1 AND Item.Parent = FIT.ID
+                )
+                SELECT id AS II, Path FROM FIT WHERE kind = 0
+            )",
+            (),
+        )?;
+        Ok(())
+    }
+
+    // Drop the table that holds the item identifiers and their full paths.
+    fn drop_temp_paths_table(&self) -> Result<(), Error> {
+        self.conn.execute("DROP TABLE IF EXISTS IndexedFiles", ())?;
+        Ok(())
+    }
+
+    // returns 0 if file not found
+    #[allow(dead_code)]
+    fn find_file_by_path(&self, relpath: &str) -> Result<i64, Error> {
+        let sql = format!(
+            "WITH RECURSIVE IT AS (
+    SELECT Item.*, ID AS FID FROM Item WHERE
+    ID IN (
+        WITH RECURSIVE FIT AS (
+            SELECT *, '/' || Name || IIF(Kind = 1, '/', '') AS Path FROM Item WHERE Parent = 0
+            UNION ALL
+            SELECT Item.*, FIT.Path || Item.Name || IIF(Item.Kind = 1, '/', '') AS Path
+                FROM Item INNER JOIN FIT ON FIT.Kind = 1 AND Item.Parent = FIT.ID
+                WHERE '/{}' LIKE (Path || '%')
+        )
+        SELECT ID FROM FIT WHERE Path IN ('/{}')
+    )
+    UNION ALL
+    SELECT Item.*, IT.FID FROM Item INNER JOIN IT ON IT.Kind = 1 AND Item.Parent = IT.ID
+),
+ITI AS (SELECT (ROW_NUMBER() OVER (ORDER BY FID, ID) - 1) AS I, * FROM IT)
+SELECT C.I, IFNULL(P.I, -1) AS PI, C.ID, C.Parent, C.Kind, C.Name FROM ITI AS C
+LEFT JOIN ITI AS P ON C.FID = P.FID AND C.Parent = P.ID ORDER BY C.I;",
+            relpath, relpath
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let item_iter = stmt.query_map([], |row| {
+            Ok(Entry {
+                id: row.get(2)?,
+                parent: row.get(3)?,
+                kind: row.get(4)?,
+                name: row.get(5)?,
+            })
+        })?;
+        for entry in item_iter {
+            return Ok(entry?.id);
+        }
+        Ok(0)
+    }
+
     //
     // Print the contents of the identified file to stdout.
     //
+    #[allow(dead_code)]
     fn print_file(&self, item_id: i64) -> Result<(), Error> {
         let mut stmt = self.conn.prepare(
             "SELECT content, contentpos, size FROM itemcontent WHERE item = ?1 ORDER BY itempos",
@@ -407,6 +574,15 @@ pub struct Entry {
     pub name: String,
 }
 
+// Result from the IndexedFiles temporary table joined with itemcontent table.
+struct IndexedFile {
+    content: i64,
+    contentpos: u64,
+    itempos: u64,
+    size: u64,
+    path: String,
+}
+
 struct OutgoingContent {
     // rowid of the content in the content table
     content: i64,
@@ -418,20 +594,25 @@ struct OutgoingContent {
 
 fn main() -> Result<(), Error> {
     let path = "./pack.db3";
-    let inpath = Path::new("src");
+    let inpath = Path::new("/Users/nfiedler/Downloads/httpd-2.4.59/modules/arch");
     let mut builder = PackBuilder::new(path)?;
     let file_count = builder.add_dir_all(inpath)?;
     builder.finish()?;
     println!("added {} files", file_count);
 
-    // list all entries in the archive in a sensible order
-    let reader = PackReader::new(path)?;
-    let entries = reader.entries()?;
-    for entry in entries {
-        println!("entry: {:?}", entry)
-    }
+    // list all entries in the archive in breadth-first order
+    // let reader = PackReader::new(path)?;
+    // let entries = reader.entries()?;
+    // for entry in entries {
+    //     println!("entry: {:?}", entry)
+    // }
 
-    // src/main.rs
-    reader.print_file(2)?;
+    // find a particular file by its path and print it
+    // let file_id = reader.find_file_by_path("arch/win32/Makefile.in")?;
+    // reader.print_file(file_id)?;
+
+    // extract all of the files in the archive
+    let reader = PackReader::new(path)?;
+    reader.extract_all()?;
     Ok(())
 }

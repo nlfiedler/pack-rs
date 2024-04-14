@@ -1,13 +1,9 @@
 * Action Items
-** TODO find a file by its path and print it
-*** see =Result= in =IndexedItemsSQLite3SQLStatement= in =UPackDraft0Shared.pas= in Pack
-** TODO extract all files from the archive, creating directories as needed
-*** consider how this can be done quickly and efficiently
-*** create a zero-length file on restore if the item has no =itemcontent= rows
-*** unix: ignore the leading =/= or =..= for absolute paths
-*** windows: ignore leading drive letter specifier
+** TODO process command-line arguments
+*** if any of the non-options refer to a pack file, then add the others to that pack
+*** if there is only one non-option and it refers to a pack file, extract its contents
 ** TODO size content bundles dynamically
-*** based on the number of incoming files
+*** based on the number of incoming files (is what Pack does)
 *** will need to experiment with different data sets to find appropriate sizes
 ** TODO process content bundles concurrently
 *** determine if SQLite is thread-safe and how to use =rusqlite= concurrently
@@ -17,13 +13,15 @@
 *** build a queue of content bundles by scanning file tree and producing sets of content bundle parameters
 *** threads take parameters, read files, combine into a bundle, compress, insert ~content~ and ~itemcontent~ rows
 ** TODO set database page size according to size of input set
-*** if more than =1mb=, page size is =4096=, otherwise =512=
+*** if more than =1mb=, page size is =4096=, otherwise =512= (is what Pack does)
 *** add a =new_with_page_size()= function or similar
+*** will need to experiment with different data sets to find appropriate sizes
 ** TODO unpack the archive using concurrent threads
 ** TODO consider optionally compressing the content bundles
 *** if compression does not make the bundle smaller, then store as-is
-*** add column to =content= table that indicates if the blob is compressed or not
-**** the =zstd= API lacks a means of detecting if data is compressed or not
+*** add column to =content= table that indicates the compression algorithm, or =none=
+**** the =zstd= crate lacks an API for detecting if data is compressed or not
+**** having an algorithm label allows for different compression algorithms
 ** TODO validate the pack file when opening
 ** TODO add a file to an existing archive
 *** should look up the full path and ensure parents exist
@@ -33,6 +31,9 @@
 **** remove any ~itemcontent~ rows for this particular item
 **** add new ~itemcontent~ rows for this new file
 ** TODO remove a file from an existing archive
+** TODO consider how to encrypt file data and/or metadata
+** TODO consider how to store symbolic links (never follow, only store)
+*** it is too dangerous and difficult to follow symbolic links safely
 ** TODO support includes/excludes when building archive
 ** TODO support includes/excludes when extracting archive
 ** TODO optionally store file times, owners, permissions in separate table
