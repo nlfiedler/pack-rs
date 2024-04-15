@@ -1,9 +1,7 @@
 * Action Items
-** TODO fix the problem with create/extract of full httpd source tree
-*** two files have only the first portion
-*** directories with nothing in them do not get recreated
 ** TODO test with Linux kernel source tree
 ** TODO test with bunches of images
+** TODO test with RocksDB database
 ** TODO test with the image that surfaced the corruption bug in =sevenz-rust=
 ** TODO size content bundles dynamically
 *** based on the number of incoming files (is what Pack does)
@@ -65,8 +63,9 @@
 | item   | integer | foreign key to ~item~ table |
 | name   | text    | name of extended attribute  |
 | value  | blob    | extended attribute bytes    |
-** TODO document what this tool is not good at doing
-*** streaming input and output: the design precludes such functionality
-*** archiving very small data sets: a 1kb file will become a 3kb pack
 ** library development plan
 *** enable creating the database in memory for unit testing purposes
+*** test cases
+- empty files
+- empty directories
+- files larger than blob size

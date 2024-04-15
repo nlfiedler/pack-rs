@@ -380,6 +380,8 @@ SELECT id, parent, kind, Path FROM FIT;";
 
     // Returns the number of files extracted.
     fn extract_all(&self) -> Result<u64, Error> {
+        // ensure all of the directories are created, even empty ones
+        self.ensure_all_directories()?;
         // create a temporary table for holding the items and their full paths;
         // start by dropping the table in case it was left behind from a
         // previous operation
@@ -410,18 +412,14 @@ SELECT id, parent, kind, Path FROM FIT;";
         while let Some(row_result) = item_iter.next() {
             let indexed_file = row_result?;
             if indexed_file.content != content_id {
-                if files.is_empty() {
-                    // first time we are processing this particular content
-                    content_id = indexed_file.content;
-                    files.push(indexed_file);
-                } else {
-                    // reached the end of the entries for this content
+                // reached the end of the entries for this content
+                if !files.is_empty() {
                     file_count += self.process_content(files)?;
-                    files = Vec::new();
-                    content_id = -1;
                 }
+                content_id = indexed_file.content;
+                files = vec![indexed_file];
             } else {
-                // another piece of the content, add to the list
+                // another piece of the same content, add to the list
                 files.push(indexed_file);
             }
         }
@@ -433,6 +431,26 @@ SELECT id, parent, kind, Path FROM FIT;";
         // clean up
         self.drop_temp_paths_table()?;
         Ok(file_count)
+    }
+
+    // Ensure that all directories in the archive are created, even those that
+    // do not contain any files.
+    fn ensure_all_directories(&self) -> Result<(), Error> {
+        let query = "WITH RECURSIVE FIT AS (
+    SELECT *, Name || IIF(Kind = 1, '/', '') AS Path FROM Item WHERE Parent = 0
+    UNION ALL
+    SELECT Item.*, FIT.Path || Item.Name || IIF(Item.Kind = 1, '/', '') AS Path
+        FROM Item INNER JOIN FIT ON FIT.Kind = 1 AND Item.Parent = FIT.ID
+)
+SELECT Path FROM FIT WHERE Kind = 1;";
+        let mut stmt = self.conn.prepare(query)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let fpath = pack_rs::sanitize_path(path)?;
+            fs::create_dir_all(fpath)?;
+        }
+        Ok(())
     }
 
     // Process a single content blob and all of the files it contains.
@@ -454,10 +472,6 @@ SELECT id, parent, kind, Path FROM FIT;";
             // is theoretically possible that the data could produce a path with
             // a root, prefix, parent-dir elements)
             let fpath = pack_rs::sanitize_path(&entry.path)?;
-            // create the directory to hold the file
-            if let Some(parent) = fpath.parent() {
-                fs::create_dir_all(parent)?;
-            }
             // make sure the file exists and is writable
             let mut output = fs::OpenOptions::new()
                 .write(true)

@@ -1,4 +1,7 @@
-
+--
+-- Bunch of SQL copied from https://github.com/PackOrganization/Pack and
+-- modified to suit various purposes.
+--
 
 -- select all rows from item table in breadth-first order
 -- result rows: <ignore>, <ignore>, rowid, parent, kind, name
@@ -88,9 +91,9 @@ INSERT INTO IndexedItems SELECT I, PI, ID, Kind, Name FROM (
                 UNION ALL
                 SELECT Item.*, FIT.Path || Item.Name || IIF(Item.Kind = 1, '/', '') AS Path
                     FROM Item INNER JOIN FIT ON FIT.Kind = 1 AND Item.Parent = FIT.ID
-                    WHERE '/arch/unix/Makefile.in' LIKE (Path || '%')
+                    WHERE '/httpd-2.4.59/docs/manual/howto/ssi.html.fr.utf8' LIKE (Path || '%')
             )
-            SELECT ID FROM FIT WHERE Path IN ('/arch/unix/Makefile.in')
+            SELECT ID FROM FIT WHERE Path IN ('/httpd-2.4.59/docs/manual/howto/ssi.html.fr.utf8')
         )
         UNION ALL
         SELECT Item.*, IT.FID FROM Item INNER JOIN IT ON IT.Kind = 1 AND Item.Parent = IT.ID
@@ -99,6 +102,10 @@ INSERT INTO IndexedItems SELECT I, PI, ID, Kind, Name FROM (
     SELECT C.I, IFNULL(P.I, -1) AS PI, C.ID, C.Parent, C.Kind, C.Name FROM ITI AS C
     LEFT JOIN ITI AS P ON C.FID = P.FID AND C.Parent = P.ID ORDER BY C.I
 );
+-- use the above index to fetch content related values
+SELECT Content, ContentPos, Item, ItemPos, Size FROM IndexedItems
+    LEFT JOIN ItemContent ON IndexedItems.Kind = 0 AND IndexedItems.ID = ItemContent.Item
+    ORDER BY Content, ContentPos;
 
 
 -- create a temporary table/index for all files

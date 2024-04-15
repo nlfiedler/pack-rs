@@ -63,7 +63,7 @@ httpd-2.4.59/BuildBin.dsp
 ...
 ```
 
-Finally, to extract the contents of the archive into the current directory:
+Finally, run `extract` to unpack the contents of the archive into the current directory:
 
 ```shell
 $ cargo run -- extract pack.db3
@@ -115,3 +115,16 @@ For very large files that are larger than the blob size, they will reference mul
 | `content`    | `INTEGER`             | rowid in the `content` table where this chunk is stored |
 | `contentpos` | `INTEGER`             | position within the chunk from the `content` table for this chunk |
 | `size`       | `INTEGER`             | the size of the chunk |
+
+## Pros and Cons
+
+### Pros
+
+* The original [Pack](https://pack.ac), and hopefully this one too, are very fast and produce fairly small archives.
+* The container format, [SQLite](https://www.sqlite.org) is small, fast, and reliable.
+* By virtue of using a database, accessing individual file content is very fast.
+
+### Cons
+
+* Not well suited to very small data sets. The overhead of the database will outweigh anything less than about 20 KB.
+* Streaming input and output, a la tar or gzip, is not feasible with this design.
