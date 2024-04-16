@@ -1,20 +1,51 @@
 * Action Items
-** TODO test with Linux kernel source tree
-** TODO test with bunches of images
-** TODO test with RocksDB database
-** TODO test with the image that surfaced the corruption bug in =sevenz-rust=
-** TODO size content bundles dynamically
-*** based on the number of incoming files (is what Pack does)
-*** will need to experiment with different data sets to find appropriate sizes
+** DONE test with Apache HTTPD 2.4.59 source
+*** pack-rs runs use a ~release~ build
+| description   | byte size | time      |
+|---------------+-----------+-----------|
+| apparent size |  42873125 | ---       |
+| zip           |  12557798 | 0m1.458s  |
+| tar.zst       |   8852419 | 0m0.379s  |
+| pack-rs       |   8843264 | 0m7.728s  |
+| Pack          |   8691712 | 0m0.244s  |
+| tar.bz2       |   7540345 | 0m4.948s  |
+| tar.xz        |   6464092 | 0m16.243s |
+** DONE test with Linux 6.8.6 source
+*** times are the lowest value of 3 runs
+*** tests that took several minutes were run only once
+| description   |       size | time      |
+|---------------+------------+-----------|
+| apparent size | 1420319384 | ---       |
+| zip           |  297273354 | 0m41.645s |
+| pack-rs       |  218058752 | 3m32.025s |
+| tar.zst       |  216776407 | 0m7.536s  |
+| tar.bz2       |  176093102 | 2m22.274s |
+| tar.xz        |  144296084 | 9m51.828s |
+** DONE test with RocksDB database; works
+| description   |      size |
+|---------------+-----------|
+| apparent size | 912619651 |
+| compressed    | 641073152 |
+** DONE test with the C++98 tutorial PDF
 ** TODO process content bundles concurrently
 *** each thread needs to have its own =Connection= instance
 *** build a queue of content bundles by scanning file tree and producing sets of content bundle parameters
 *** threads take parameters, read files, combine into a bundle, compress, insert ~content~ and ~itemcontent~ rows
+** TODO unpack the archive concurrently
+** TODO test on Windows and update prerequisites
+** TODO test on RockyLinux 9 and provide install instructions
+** TODO improve error handling
+*** avoid the generic ~No such file or directory~ error
+*** specifying files/folders that do not exist
+*** specifying =pack= to list/extract when =pack.db3= exists should use that name
+** TODO size content bundles dynamically
+*** based on the number of incoming files (is what Pack does)
+*** will need to experiment with different data sets to find appropriate sizes
+** TODO consider the zstandard tuning that Pack does, maybe it helps
 ** TODO set database page size according to size of input set
 *** if more than =1mb=, page size is =4096=, otherwise =512= (is what Pack does)
 *** add a =new_with_page_size()= function or similar
 *** will need to experiment with different data sets to find appropriate sizes
-** TODO unpack the archive concurrently
 ** TODO consider optionally compressing the content bundles
 *** if compression does not make the bundle smaller, then store as-is
 *** add column to =content= table that indicates the compression algorithm, or =none=
@@ -36,8 +67,6 @@
 - total bytes read
 - total compressed size
 ** TODO consider how to encrypt file data and/or metadata
-** TODO consider how to store symbolic links (never follow, only store)
-*** it is too dangerous and difficult to follow symbolic links safely
 ** TODO support includes/excludes when building archive
 ** TODO support includes/excludes when extracting archive
 ** TODO optionally store file times, owners, permissions in separate table

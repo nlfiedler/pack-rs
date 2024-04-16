@@ -142,37 +142,39 @@ SELECT Content, ContentPos, I AS ItemIndex, ItemPos, Size FROM IndexedFiles
 -- 1 | 198322 | 16 | 0 | 6899
 
 -- create a temporary table/index of all files with full paths
-CREATE TEMPORARY TABLE IndexedFiles (II INTEGER PRIMARY KEY, Path);
-INSERT INTO IndexedFiles SELECT II, Path FROM (
+CREATE TEMPORARY TABLE IndexedFiles (II INTEGER PRIMARY KEY, kind INTEGER, path TEXT);
+INSERT INTO IndexedFiles SELECT II, kind, Path FROM (
     WITH RECURSIVE FIT AS (
         SELECT *, Name || IIF(Kind = 1, '/', '') AS Path FROM Item WHERE Parent = 0
         UNION ALL
         SELECT Item.*, FIT.Path || Item.Name || IIF(Item.Kind = 1, '/', '') AS Path
             FROM Item INNER JOIN FIT ON FIT.Kind = 1 AND Item.Parent = FIT.ID
     )
-    SELECT id AS II, Path FROM FIT WHERE kind = 0
+    SELECT id AS II, kind, Path FROM FIT WHERE kind <> 1
 );
 -- use the above index to fetch content related values
 -- add a select on II as ItemId to then batch writes based on the item
 -- (that is, for any particular item, batch all of the operations into a single task)
-SELECT content, contentpos, itempos, Size, Path FROM IndexedFiles
+SELECT content, contentpos, itempos, Size, kind, Path FROM IndexedFiles
     LEFT JOIN itemcontent ON IndexedFiles.II = ItemContent.Item
     ORDER BY content, contentpos;
 -- exmaple output
--- 1 |      0 | 0 |  4634 | arch/win32/mod_isapi.dsp
--- 1 |   4634 | 0 |  2356 | arch/win32/mod_isapi.dep
--- 1 |   6990 | 0 | 10058 | arch/win32/mod_isapi.mak
--- 1 |  17048 | 0 | 11184 | arch/win32/mod_isapi.h
--- 1 |  28232 | 0 |   241 | arch/win32/config.m4
--- 1 |  28473 | 0 | 64916 | arch/win32/mod_isapi.c
--- 1 |  93389 | 0 |   183 | arch/win32/Makefile.in
--- 1 |  93572 | 0 | 19747 | arch/win32/mod_win32.c
--- 1 | 113319 | 0 | 13351 | arch/unix/mod_unixd.c
--- 1 | 126670 | 0 |   944 | arch/unix/config5.m4
--- 1 | 127614 | 0 |  3897 | arch/unix/mod_systemd.c
--- 1 | 131511 | 0 |  1114 | arch/unix/mod_unixd.h
--- 1 | 132625 | 0 | 21905 | arch/unix/mod_privileges.c
--- 1 | 154530 | 0 |    41 | arch/unix/Makefile.in
--- 1 | 154571 | 0 | 41349 | arch/netware/mod_nw_ssl.c
--- 1 | 195920 | 0 |  2402 | arch/netware/libprews.c
--- 1 | 198322 | 0 |  6899 | arch/netware/mod_netware.c
+-- 1 |      0 | 0 |     0 | 0 | arch/empty_file.txt
+-- 1 |      0 | 0 |     4 | 2 | arch/link_to_unix
+-- 1 |      4 | 0 |  4634 | 0 | arch/win32/mod_isapi.dsp
+-- 1 |   4638 | 0 |  2356 | 0 | arch/win32/mod_isapi.dep
+-- 1 |   6994 | 0 | 10058 | 0 | arch/win32/mod_isapi.mak
+-- 1 |  17052 | 0 | 11184 | 0 | arch/win32/mod_isapi.h
+-- 1 |  28236 | 0 |   241 | 0 | arch/win32/config.m4
+-- 1 |  28477 | 0 | 64916 | 0 | arch/win32/mod_isapi.c
+-- 1 |  93393 | 0 |   183 | 0 | arch/win32/Makefile.in
+-- 1 |  93576 | 0 | 19747 | 0 | arch/win32/mod_win32.c
+-- 1 | 113323 | 0 | 13351 | 0 | arch/unix/mod_unixd.c
+-- 1 | 126674 | 0 |   944 | 0 | arch/unix/config5.m4
+-- 1 | 127618 | 0 |  3897 | 0 | arch/unix/mod_systemd.c
+-- 1 | 131515 | 0 |  1114 | 0 | arch/unix/mod_unixd.h
+-- 1 | 132629 | 0 | 21905 | 0 | arch/unix/mod_privileges.c
+-- 1 | 154534 | 0 |    41 | 0 | arch/unix/Makefile.in
+-- 1 | 154575 | 0 | 41349 | 0 | arch/netware/mod_nw_ssl.c
+-- 1 | 195924 | 0 |  2402 | 0 | arch/netware/libprews.c
+-- 1 | 198326 | 0 |  6899 | 0 | arch/netware/mod_netware.c

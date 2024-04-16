@@ -11,10 +11,10 @@ Short term features:
 * Build an archive concurrently using multiple threads; same for extract.
 * Size the content bundles dynamically based on the incoming data size.
 * Set the database page size dynamically based on the incoming data size.
+* Extract a single file from an archive.
 * Add a new file to an existing archive.
 * Remove a file from an archive.
 * Support include/exclude patterns when building or extracting an archive.
-* Store symbolic links (currently ignored).
 
 In the long term, there are additional features that would be nice-to-have:
 
@@ -28,6 +28,14 @@ In the long term, there are additional features that would be nice-to-have:
 ### Prerequisites
 
 * [Rust](https://www.rust-lang.org) 2021 edition
+* C/C++ toolchain:
+    - macOS: [Clang](https://clang.llvm.org) probably?
+    - Ubuntu: `sudo apt-get install build-essential`
+    - Windows: MSVC probably
+* SQLite 3 library:
+    - macOS: `brew install sqlite`
+    - Ubuntu: `sudo apt-get install libsqlite3-dev`
+    - Windows: TBD
 
 ### Running the tests
 
@@ -79,13 +87,13 @@ A pack file is an [SQLite](https://www.sqlite.org) database with file data store
 
 ### item
 
-Rows in the `item` table represent both directories and files. The `kind` for files is `0` and the `kind` for directories is `1`. The `name` is the final part of the file path, such as `README.md` or `src`. The `parent` refers to the directory that contains this entry on the file system, with `0` indicating the entry is at the "root" of the archive.
+Rows in the `item` table represent both directories, files, and symbolic links. The `kind` for files is `0`, the `kind` for directories is `1`, and the `kind` for symbolic links is `2`. The `name` is the final part of the file path, such as `README.md` or `src`. The `parent` refers to the directory that contains this entry on the file system, with `0` indicating the entry is at the "root" of the archive.
 
 | Name     | Type                  | Description        |
 | -------- | --------------------- | ------------------ |
 | `id`     | `INTEGER PRIMARY KEY` | rowid for the item |
 | `parent` | `INTEGER`             | rowid in the `item` table for the directory that contains this |
-| `kind`   | `INTEGER`             | either `0` (file) or `1` (directory) |
+| `kind`   | `INTEGER`             | `0` (file), `1` (directory), `2` (symlink) |
 | `name`   | `TEXT NOT NULL`       | name of the directory or file |
 
 ### content
@@ -99,13 +107,15 @@ Rows in the `content` table are nothing more than huge blobs of compressed data 
 
 The content blobs are built up from the contents of as many files as it takes to fill the target blob size, at which point the entire block is compressed using Zstandard (without a dictionary). How the file contents are mapped to the content blobs is defined in the `itemcontent` table described below.
 
+For symbolic links, the raw bytes are stored as if they were file content.
+
 ### itemcontent
 
 The `itemcontent` table is the glue that binds the rows from the `item` table to the huge blobs in the `content` table. Typically a blob is large enough to hold many files, as such this table will show which blob contains the data for a particular file, and where within the (decompressed) blob to read the data.
 
 For very large files that are larger than the blob size, they will reference multiple rows from the `content` table. The `itempos` and `contentpos` values make it possible to accommodate both small files that fit within a blob and large files that do not.
 
-**Note:** empty files will have a row in the `itemcontent` table with a `size` of zero to make it easier to write the extraction implementation.
+Empty files will have a row in the `itemcontent` table with a `size` of zero to make it easier to write the extraction implementation.
 
 | Name         | Type                  | Description               |
 | ------------ | --------------------- | ------------------------- |
@@ -117,6 +127,8 @@ For very large files that are larger than the blob size, they will reference mul
 | `size`       | `INTEGER`             | the size of the chunk |
 
 ## Pros and Cons
+
+Like any solution to a complex problem, this design involves certain tradeoffs.
 
 ### Pros
 

@@ -9,8 +9,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::{fs, vec};
 
-const KIND_FILE: i64 = 0;
-const KIND_DIRECTORY: i64 = 1;
+const KIND_FILE: i8 = 0;
+const KIND_DIRECTORY: i8 = 1;
+const KIND_SYMLINK: i8 = 2;
 const BUNDLE_SIZE: u64 = 16777216;
 
 //
@@ -56,6 +57,8 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
 struct IncomingContent {
     // path of the file being packed
     path: PathBuf,
+    // kind of item: file or symlink
+    kind: i8,
     // the rowid in the item table
     item: i64,
     // offset within the file from which to start, usually zero
@@ -127,6 +130,8 @@ impl PackBuilder {
                 } else if metadata.is_file() {
                     self.add_file(&path, parent_id)?;
                     file_count += 1;
+                } else if metadata.is_symlink() {
+                    self.add_symlink(&path, parent_id)?;
                 }
             }
         }
@@ -171,12 +176,12 @@ impl PackBuilder {
             (&parent, KIND_FILE, &name),
         )?;
         let item_id = self.conn.last_insert_rowid();
-        let md = fs::symlink_metadata(path.as_ref());
+        let md = fs::metadata(path.as_ref());
         let file_len = match md.as_ref() {
             Ok(attr) => attr.len(),
             Err(_) => 0,
         };
-        // empty files will result in a an itemcontent row whose size is zero,
+        // empty files will result in an itemcontent row whose size is zero,
         // allowing for the extraction process to know to create an empty file
         // (otherwise it is difficult to tell from the available data)
         let mut itempos: u64 = 0;
@@ -187,6 +192,7 @@ impl PackBuilder {
                 // add a portion of the file to fill the bundle
                 let content = IncomingContent {
                     path: path.as_ref().to_path_buf(),
+                    kind: KIND_FILE,
                     item: item_id,
                     itempos,
                     contentpos: self.bundle.current_pos,
@@ -204,6 +210,7 @@ impl PackBuilder {
                 // the remainder of the file fits within this content bundle
                 let content = IncomingContent {
                     path: path.as_ref().to_path_buf(),
+                    kind: KIND_FILE,
                     item: item_id,
                     itempos,
                     contentpos: self.bundle.current_pos,
@@ -214,6 +221,38 @@ impl PackBuilder {
                 break;
             }
         }
+        Ok(item_id)
+    }
+
+    ///
+    /// Adds a symbolic link to the archive, returning the item identifier.
+    ///
+    /// **Note:** Remember to call `finish()` when done adding content.
+    ///
+    fn add_symlink<P: AsRef<Path>>(&mut self, path: P, parent: i64) -> Result<i64, Error> {
+        let name = get_file_name(path.as_ref());
+        self.conn.execute(
+            "INSERT INTO item (parent, kind, name) VALUES (?1, ?2, ?3)",
+            (&parent, KIND_SYMLINK, &name),
+        )?;
+        let item_id = self.conn.last_insert_rowid();
+        let md = fs::symlink_metadata(path.as_ref());
+        let link_len = match md.as_ref() {
+            Ok(attr) => attr.len(),
+            Err(_) => 0,
+        };
+        // assume that the link value is relatively small and simply add it into
+        // the current content bundle in whole
+        let content = IncomingContent {
+            path: path.as_ref().to_path_buf(),
+            kind: KIND_SYMLINK,
+            item: item_id,
+            itempos: 0,
+            contentpos: self.bundle.current_pos,
+            size: link_len,
+        };
+        self.bundle.contents.push(content);
+        self.bundle.current_pos += link_len;
         Ok(item_id)
     }
 
@@ -242,10 +281,15 @@ impl PackBuilder {
 
         // iterate through the file contents to build the compressed bundle
         for item in self.bundle.contents.iter() {
-            let mut input = fs::File::open(&item.path)?;
-            input.seek(SeekFrom::Start(item.itempos))?;
-            let mut chunk = input.take(item.size);
-            io::copy(&mut chunk, &mut encoder)?;
+            if item.kind == KIND_FILE {
+                let mut input = fs::File::open(&item.path)?;
+                input.seek(SeekFrom::Start(item.itempos))?;
+                let mut chunk = input.take(item.size);
+                io::copy(&mut chunk, &mut encoder)?;
+            } else if item.kind == KIND_SYMLINK {
+                let value = read_link(&item.path)?;
+                encoder.write_all(&value)?;
+            }
         }
         content = encoder.finish()?;
         let compressed_len = content.len();
@@ -328,6 +372,38 @@ fn get_file_name<P: AsRef<Path>>(path: P) -> String {
 }
 
 ///
+/// Read the symbolic link value and convert to raw bytes.
+///
+fn read_link(path: &Path) -> Result<Vec<u8>, Error> {
+    // convert whatever value returned by the OS into raw bytes without string conversion
+    use os_str_bytes::OsStringBytes;
+    let value = fs::read_link(path)?;
+    Ok(value.into_os_string().into_raw_vec())
+}
+
+///
+/// Create a symbolic link using the given raw bytes.
+///
+fn write_link(contents: &[u8], filepath: &Path) -> Result<(), Error> {
+    use os_str_bytes::OsStringBytes;
+    // this may panic if the bytes are not valid for this platform
+    let target = std::ffi::OsString::from_io_vec(contents.to_owned())
+        .ok_or_else(|| Error::LinkTextEncoding)?;
+    // cfg! macro will not work in this OS-specific import case
+    {
+        #[cfg(target_family = "unix")]
+        use std::os::unix::fs;
+        #[cfg(target_family = "windows")]
+        use std::os::windows::fs;
+        #[cfg(target_family = "unix")]
+        fs::symlink(target, filepath)?;
+        #[cfg(target_family = "windows")]
+        fs::symlink_file(target, filepath)?;
+    }
+    return Ok(());
+}
+
+///
 /// Reads the contents of an archive.
 ///
 struct PackReader {
@@ -391,7 +467,7 @@ SELECT id, parent, kind, Path FROM FIT;";
         // join the item paths with the itemcontent rows and sort by the content
         // blob order, making it easier to efficiently process the content blobs
         let mut stmt = self.conn.prepare(
-            "SELECT content, contentpos, itempos, Size, Path FROM IndexedFiles
+            "SELECT content, contentpos, itempos, Size, kind, Path FROM IndexedFiles
             LEFT JOIN itemcontent ON IndexedFiles.II = ItemContent.Item
             ORDER BY content, contentpos",
         )?;
@@ -401,7 +477,8 @@ SELECT id, parent, kind, Path FROM FIT;";
                 contentpos: row.get(1)?,
                 itempos: row.get(2)?,
                 size: row.get(3)?,
-                path: row.get(4)?,
+                kind: row.get(4)?,
+                path: row.get(5)?,
             })
         })?;
 
@@ -472,32 +549,42 @@ SELECT Path FROM FIT WHERE Kind = 1;";
             // is theoretically possible that the data could produce a path with
             // a root, prefix, parent-dir elements)
             let fpath = pack_rs::sanitize_path(&entry.path)?;
-            // make sure the file exists and is writable
-            let mut output = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .open(&fpath)?;
-            let file_len = fs::metadata(fpath)?.len();
-            if file_len == 0 {
-                // just created a new file, count it
-                file_count += 1;
-            }
-            // if the file was an empty file, then we are already done here
-            if entry.size > 0 {
-                // ensure the file has the appropriate length for writing this
-                // content chunk into the file, extending it as necessary
-                if file_len < entry.itempos {
-                    output.set_len(entry.itempos)?;
+            if entry.kind == KIND_FILE {
+                // make sure the file exists and is writable
+                let mut output = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .open(&fpath)?;
+                let file_len = fs::metadata(fpath)?.len();
+                if file_len == 0 {
+                    // just created a new file, count it
+                    file_count += 1;
                 }
-                // seek to the correct position within the file for this chunk
-                if entry.itempos > 0 {
-                    output.seek(SeekFrom::Start(entry.itempos))?;
+                // if the file was an empty file, then we are already done here
+                if entry.size > 0 {
+                    // ensure the file has the appropriate length for writing this
+                    // content chunk into the file, extending it as necessary
+                    if file_len < entry.itempos {
+                        output.set_len(entry.itempos)?;
+                    }
+                    // seek to the correct position within the file for this chunk
+                    if entry.itempos > 0 {
+                        output.seek(SeekFrom::Start(entry.itempos))?;
+                    }
+                    // use Cursor because that's seemingly easier than getting a slice
+                    let mut cursor = std::io::Cursor::new(&buffer);
+                    cursor.seek(SeekFrom::Start(entry.contentpos))?;
+                    let mut chunk = cursor.take(entry.size);
+                    io::copy(&mut chunk, &mut output)?;
                 }
+            } else if entry.kind == KIND_SYMLINK {
                 // use Cursor because that's seemingly easier than getting a slice
                 let mut cursor = std::io::Cursor::new(&buffer);
                 cursor.seek(SeekFrom::Start(entry.contentpos))?;
                 let mut chunk = cursor.take(entry.size);
-                io::copy(&mut chunk, &mut output)?;
+                let mut raw_bytes: Vec<u8> = vec![];
+                chunk.read_to_end(&mut raw_bytes)?;
+                write_link(&raw_bytes, &fpath)?;
             }
         }
 
@@ -508,18 +595,18 @@ SELECT Path FROM FIT WHERE Kind = 1;";
     // populate it using the values in the item table.
     fn create_temp_paths_table(&self) -> Result<(), Error> {
         self.conn.execute(
-            "CREATE TEMPORARY TABLE IndexedFiles (II INTEGER PRIMARY KEY, Path)",
+            "CREATE TEMPORARY TABLE IndexedFiles (II INTEGER PRIMARY KEY, kind INTEGER, path TEXT)",
             (),
         )?;
         self.conn.execute(
-            "INSERT INTO IndexedFiles SELECT II, Path FROM (
+            "INSERT INTO IndexedFiles SELECT II, kind, Path FROM (
                 WITH RECURSIVE FIT AS (
                     SELECT *, Name || IIF(Kind = 1, '/', '') AS Path FROM Item WHERE Parent = 0
                     UNION ALL
                     SELECT Item.*, FIT.Path || Item.Name || IIF(Item.Kind = 1, '/', '') AS Path
                         FROM Item INNER JOIN FIT ON FIT.Kind = 1 AND Item.Parent = FIT.ID
                 )
-                SELECT id AS II, Path FROM FIT WHERE kind = 0
+                SELECT id AS II, kind, Path FROM FIT WHERE kind <> 1
             )",
             (),
         )?;
@@ -619,7 +706,7 @@ fn list_contents(pack: &str) -> Result<(), Error> {
     let entries = reader.entries()?;
     for result in entries {
         let entry = result?;
-        if entry.kind == KIND_FILE {
+        if entry.kind != KIND_DIRECTORY {
             println!("{}", entry.name)
         }
     }
@@ -645,16 +732,18 @@ fn extract_contents(pack: &str) -> Result<u64, Error> {
 pub struct Entry {
     pub id: i64,
     pub parent: i64,
-    pub kind: i64,
+    pub kind: i8,
     pub name: String,
 }
 
 // Result from the IndexedFiles temporary table joined with itemcontent table.
+#[derive(Debug)]
 struct IndexedFile {
     content: i64,
     contentpos: u64,
     itempos: u64,
     size: u64,
+    kind: i8,
     path: String,
 }
 

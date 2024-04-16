@@ -23,6 +23,9 @@ pub enum Error {
     /// The named pack file was not one of ours.
     #[error("pack file format not recognized")]
     NotPackFile,
+    /// The symbolic link bytes were not decipherable.
+    #[error("symbolic link encoding was not recognized")]
+    LinkTextEncoding,
 }
 
 // Expected SQLite database header: "SQLite format 3\0"
