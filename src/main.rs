@@ -5,9 +5,11 @@ use clap::{arg, Command};
 use pack_rs::Error;
 use rusqlite::blob::ZeroBlob;
 use rusqlite::{Connection, DatabaseName};
+use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::{fs, vec};
+use std::sync::{Arc, Mutex};
+use std::vec;
 
 const KIND_FILE: i8 = 0;
 const KIND_DIRECTORY: i8 = 1;
@@ -69,25 +71,20 @@ struct IncomingContent {
     size: u64,
 }
 
-//
-// Holds information about a virtual content bundle and the file portions that
-// will be written to this bundle when it is committed to the database.
-//
-struct ContentBundle {
-    // byte offset within the bundle to which new content is added
-    current_pos: u64,
-    // list of item content that will reside in this bundle
-    contents: Vec<IncomingContent>,
-}
-
 ///
 /// Creates or updates an archive.
 ///
 struct PackBuilder {
     // database connection
     conn: Connection,
-    // data on the file portions that constitute a virtual content bundle
-    bundle: ContentBundle,
+    // byte offset within a bundle to which new content is added
+    current_pos: u64,
+    // item content that will reside in the bundle under construction
+    contents: Vec<IncomingContent>,
+    // task runner used to build content bundles concurrently
+    runner: pack_rs::TaskRunner,
+    // collection of errors returned from the task runners
+    errors: Arc<Mutex<Vec<Error>>>,
 }
 
 impl PackBuilder {
@@ -97,14 +94,17 @@ impl PackBuilder {
     ///
     fn new<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
         let conn = Connection::open(path.as_ref())?;
-        let bundle = ContentBundle {
-            current_pos: 0,
-            contents: vec![],
-        };
         // can set the page_size when creating the database, but not after
         // conn.pragma_update(None, "page_size", 512)?;
         create_tables(&conn)?;
-        Ok(Self { conn, bundle })
+        let runner = pack_rs::TaskRunner::new(0);
+        Ok(Self {
+            conn,
+            current_pos: 0,
+            contents: vec![],
+            runner,
+            errors: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 
     ///
@@ -139,12 +139,45 @@ impl PackBuilder {
     }
 
     ///
+    /// Create a copy of the database connection.
+    ///
+    fn copy_connection(&self) -> Result<Connection, Error> {
+        let conn = Connection::open(self.conn.path().ok_or_else(|| Error::Database)?)?;
+        Ok(conn)
+    }
+
+    ///
     /// Call `finish()` when all file content has been added to the builder.
     ///
     fn finish(&mut self) -> Result<(), Error> {
-        if !self.bundle.contents.is_empty() {
-            self.insert_content()?;
+        if !self.contents.is_empty() {
+            self.process_contents()?;
+            self.runner.wait_until_done();
+            let lock = &*self.errors;
+            let errors = lock.lock().unwrap();
+            for err in errors.iter() {
+                println!("error: {:?}", err);
+            }
         }
+        Ok(())
+    }
+
+    ///
+    /// Process the current bundle of item content, clearing the collection and
+    /// resetting the current content position.
+    ///
+    fn process_contents(&mut self) -> Result<(), Error> {
+        let conn = self.copy_connection()?;
+        let bundle = self.contents.drain(..).collect();
+        let err_lock = self.errors.clone();
+        self.current_pos = 0;
+        self.runner.execute(move || {
+            if let Err(err) = insert_content(conn, bundle) {
+                let lock = &*err_lock;
+                let mut errors = lock.lock().unwrap();
+                errors.push(err);
+            }
+        })?;
         Ok(())
     }
 
@@ -187,23 +220,21 @@ impl PackBuilder {
         let mut itempos: u64 = 0;
         let mut size: u64 = file_len;
         loop {
-            if self.bundle.current_pos + size > BUNDLE_SIZE {
-                let remainder = BUNDLE_SIZE - self.bundle.current_pos;
+            if self.current_pos + size > BUNDLE_SIZE {
+                let remainder = BUNDLE_SIZE - self.current_pos;
                 // add a portion of the file to fill the bundle
                 let content = IncomingContent {
                     path: path.as_ref().to_path_buf(),
                     kind: KIND_FILE,
                     item: item_id,
                     itempos,
-                    contentpos: self.bundle.current_pos,
+                    contentpos: self.current_pos,
                     size: remainder,
                 };
-                self.bundle.contents.push(content);
-                // insert the content and itemcontent rows
-                self.insert_content()?;
-                // start a new bundle and continue with the current file
-                self.bundle.current_pos = 0;
-                self.bundle.contents = vec![];
+                self.contents.push(content);
+                // insert the content and itemcontent rows and start a new
+                // bundle, then continue with the current file
+                self.process_contents()?;
                 size -= remainder;
                 itempos += remainder;
             } else {
@@ -213,11 +244,11 @@ impl PackBuilder {
                     kind: KIND_FILE,
                     item: item_id,
                     itempos,
-                    contentpos: self.bundle.current_pos,
+                    contentpos: self.current_pos,
                     size,
                 };
-                self.bundle.contents.push(content);
-                self.bundle.current_pos += size;
+                self.contents.push(content);
+                self.current_pos += size;
                 break;
             }
         }
@@ -248,86 +279,79 @@ impl PackBuilder {
             kind: KIND_SYMLINK,
             item: item_id,
             itempos: 0,
-            contentpos: self.bundle.current_pos,
+            contentpos: self.current_pos,
             size: link_len,
         };
-        self.bundle.contents.push(content);
-        self.bundle.current_pos += link_len;
+        self.contents.push(content);
+        self.current_pos += link_len;
         Ok(item_id)
     }
+}
 
-    //
-    // Creates a content bundle based on the data collected so far, then
-    // compresses it, writing the blob to a new row in the `content` table. Then
-    // creates the necessary rows in the `itemcontent` table to map the file
-    // data to the content bundle.
-    //
-    fn insert_content(&mut self) -> Result<(), Error> {
-        // Set bundle capacity to some estimate of expected size with half of
-        // the total size being a rough estimate, since the file data will be
-        // compressed on the way in; worst case the vector will reallocate to
-        // twice the size once or twice instead of many times.
-        let total_size: Option<u64> = self
-            .bundle
-            .contents
-            .iter()
-            .map(|e| e.size)
-            .reduce(|acc, e| acc + e);
-        let mut content: Vec<u8> = match total_size {
-            Some(size) => Vec::with_capacity((size / 2) as usize),
-            None => Vec::new(),
-        };
-        let mut encoder = zstd::stream::write::Encoder::new(content, 0)?;
+//
+// Creates a content bundle based on the data collected so far, then compresses
+// it, writing the blob to a new row in the `content` table. Then creates the
+// necessary rows in the `itemcontent` table to map the file data to the content
+// bundle.
+//
+fn insert_content(conn: Connection, bundle: Vec<IncomingContent>) -> Result<(), Error> {
+    // Set bundle capacity to some estimate of expected size with half of the
+    // total size being a rough estimate, since the file data will be compressed
+    // on the way in; worst case the vector will reallocate to twice the size
+    // two times instead of many times.
+    let total_size: Option<u64> = bundle.iter().map(|e| e.size).reduce(|acc, e| acc + e);
+    let mut content: Vec<u8> = match total_size {
+        Some(size) => Vec::with_capacity((size / 2) as usize),
+        None => Vec::new(),
+    };
+    let mut encoder = zstd::stream::write::Encoder::new(content, 0)?;
 
-        // iterate through the file contents to build the compressed bundle
-        for item in self.bundle.contents.iter() {
-            if item.kind == KIND_FILE {
-                let mut input = fs::File::open(&item.path)?;
-                input.seek(SeekFrom::Start(item.itempos))?;
-                let mut chunk = input.take(item.size);
-                io::copy(&mut chunk, &mut encoder)?;
-            } else if item.kind == KIND_SYMLINK {
-                let value = read_link(&item.path)?;
-                encoder.write_all(&value)?;
-            }
+    // iterate through the file contents to build the compressed bundle
+    for item in bundle.iter() {
+        if item.kind == KIND_FILE {
+            let mut input = fs::File::open(&item.path)?;
+            input.seek(SeekFrom::Start(item.itempos))?;
+            let mut chunk = input.take(item.size);
+            io::copy(&mut chunk, &mut encoder)?;
+        } else if item.kind == KIND_SYMLINK {
+            let value = read_link(&item.path)?;
+            encoder.write_all(&value)?;
         }
-        content = encoder.finish()?;
-        let compressed_len = content.len();
+    }
+    content = encoder.finish()?;
+    let compressed_len = content.len();
 
-        // create space for the blob by inserting a zeroblob and then
-        // overwriting it with the compressed content bundle
-        self.conn.execute(
-            "INSERT INTO content (value) VALUES (?1)",
-            [ZeroBlob(compressed_len as i32)],
-        )?;
-        let content_id = self.conn.last_insert_rowid();
-        let mut blob =
-            self.conn
-                .blob_open(DatabaseName::Main, "content", "value", content_id, false)?;
-        let bytes_written = blob.write(&content)?;
-        if bytes_written != content.len() {
-            return Err(Error::IncompleteBlobWrite);
-        }
+    // create space for the blob by inserting a zeroblob and then overwriting it
+    // with the compressed content bundle
+    conn.execute(
+        "INSERT INTO content (value) VALUES (?1)",
+        [ZeroBlob(compressed_len as i32)],
+    )?;
+    let content_id = conn.last_insert_rowid();
+    let mut blob = conn.blob_open(DatabaseName::Main, "content", "value", content_id, false)?;
+    let bytes_written = blob.write(&content)?;
+    if bytes_written != content.len() {
+        return Err(Error::IncompleteBlobWrite);
+    }
 
-        // iterate through the item contents and insert new itemcontent rows
-        for item in self.bundle.contents.iter() {
-            // create the mapping for this bit of content
-            self.conn.execute(
-                "INSERT INTO itemcontent (
+    // iterate through the item contents and insert new itemcontent rows
+    for item in bundle.iter() {
+        // create the mapping for this bit of content
+        conn.execute(
+            "INSERT INTO itemcontent (
                     item, itempos, content, contentpos, size
                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                (
-                    &item.item,
-                    &item.itempos,
-                    &content_id,
-                    &item.contentpos,
-                    &item.size,
-                ),
-            )?;
-        }
-
-        Ok(())
+            (
+                &item.item,
+                &item.itempos,
+                &content_id,
+                &item.contentpos,
+                &item.size,
+            ),
+        )?;
     }
+
+    Ok(())
 }
 
 ///

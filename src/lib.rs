@@ -5,6 +5,11 @@ use rusqlite::Connection;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::thread;
+
+/// Task runner job.
+type Job = Box<dyn FnOnce() + Send + 'static>;
 
 ///
 /// This type represents all possible errors that can occur within this crate.
@@ -17,6 +22,9 @@ pub enum Error {
     /// Error occurred during an SQL related operation.
     #[error("SQL error: {0}")]
     SQLError(#[from] rusqlite::Error),
+    /// Error occurred during an mpsc related operation.
+    #[error("async mpsc error: {0}")]
+    JobError(#[from] std::sync::mpsc::SendError<Job>),
     /// When writing file content to a blob, the result was incomplete.
     #[error("could not write entire file part to blob")]
     IncompleteBlobWrite,
@@ -26,6 +34,143 @@ pub enum Error {
     /// The symbolic link bytes were not decipherable.
     #[error("symbolic link encoding was not recognized")]
     LinkTextEncoding,
+    /// Something happened when operating on the database.
+    #[error("error resulting from database operation")]
+    Database,
+    /// Thread pool is shutting down
+    #[error("thread pool is shutting down")]
+    ThreadPoolShutdown,
+}
+
+///
+/// Use `new()` to create a thread pool and `execute()` to send functions to be
+/// executed on the worker threads. To wait for all pending tasks to finish,
+/// call `wait_until_done()`, or simply drop the pool.
+///
+pub struct TaskRunner {
+    // pool of workers to facilitate a clean shutdown
+    workers: Vec<Worker>,
+    // channel through which tasks are sent to workers
+    sender: Option<mpsc::SyncSender<crate::Job>>,
+    // job_tracker 2-tuple that tracks jobs-started and jobs-completed
+    job_tracker: Arc<(Mutex<(u64, u64)>, Condvar)>,
+}
+
+impl TaskRunner {
+    ///
+    /// Create a new TaskRunner that will run jobs on separate threads.
+    ///
+    /// The `size` is the number of threads in the pool. If zero, will try to
+    /// get the number of CPU cores available, defaulting to 1 if error.
+    ///
+    pub fn new(size: usize) -> TaskRunner {
+        let cpu_count = std::thread::available_parallelism().map_or(1, |e| e.get());
+        let pool_size = if size == 0 { cpu_count } else { size };
+        let (sender, receiver) = mpsc::sync_channel(pool_size);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let tracker: Arc<(Mutex<(u64, u64)>, Condvar)> =
+            Arc::new((Mutex::new((0, 0)), Condvar::new()));
+        let mut workers = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            workers.push(Worker::new(Arc::clone(&receiver), tracker.clone()));
+        }
+        TaskRunner {
+            workers,
+            sender: Some(sender),
+            job_tracker: tracker,
+        }
+    }
+
+    ///
+    /// Execute the given function on a worker in the pool.
+    ///
+    /// The call will block if the pool is busy.
+    ///
+    pub fn execute<F>(&mut self, f: F) -> Result<(), crate::Error>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        if let Some(sender) = self.sender.as_ref() {
+            let job = Box::new(f);
+            // bump the jobs-started counter by one
+            let (lock, cvar) = &*self.job_tracker;
+            let mut counts = lock.lock().unwrap();
+            counts.0 += 1;
+            cvar.notify_all();
+            Ok(sender.send(job)?)
+        } else {
+            Err(crate::Error::ThreadPoolShutdown)
+        }
+    }
+
+    ///
+    /// Wait for the number of completed jobs to equal the number of started jobs.
+    ///
+    /// Returns the number of completed jobs.
+    ///
+    pub fn wait_until_done(&mut self) -> u64 {
+        let (lock, cvar) = &*self.job_tracker;
+        let mut counts = lock.lock().unwrap();
+        while counts.0 != counts.1 {
+            counts = cvar.wait(counts).unwrap();
+        }
+        counts.1
+    }
+
+    ///
+    /// Returns the size of the thread pool.
+    ///
+    pub fn size(&self) -> usize {
+        self.workers.len()
+    }
+}
+
+impl Drop for TaskRunner {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        for worker in &mut self.workers {
+            if let Some(thread) = worker.thread.take() {
+                thread.join().expect("failed to join thread")
+            }
+        }
+    }
+}
+
+struct Worker {
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Worker {
+    fn new(
+        receiver: Arc<Mutex<mpsc::Receiver<crate::Job>>>,
+        tracker: Arc<(Mutex<(u64, u64)>, Condvar)>,
+    ) -> Worker {
+        let thread = thread::spawn(move || loop {
+            let message = match receiver.lock() {
+                Ok(guard) => guard.recv(),
+                Err(poisoned) => {
+                    // hard to imagine how this would matter
+                    poisoned.into_inner().recv()
+                }
+            };
+            match message {
+                Ok(job) => {
+                    job();
+                }
+                Err(_) => {
+                    break;
+                }
+            }
+            // bump the jobs-completed counter by one
+            let (lock, cvar) = &*tracker;
+            let mut counts = lock.lock().unwrap();
+            counts.1 += 1;
+            cvar.notify_all();
+        });
+        Worker {
+            thread: Some(thread),
+        }
+    }
 }
 
 // Expected SQLite database header: "SQLite format 3\0"
@@ -107,5 +252,27 @@ mod tests {
         let result = sanitize_path(Path::new("/usr/../src/./lib.rs"))?;
         assert_eq!(result, PathBuf::from("usr/src/lib.rs"));
         Ok(())
+    }
+
+    #[test]
+    fn test_task_runner() {
+        let counter = Arc::new(Mutex::new(0));
+        // scope the pool so it will be dropped and shut down
+        {
+            let mut pool = TaskRunner::new(4);
+            for _ in 0..8 {
+                let counter = counter.clone();
+                pool.execute(move || {
+                    let mut v = counter.lock().unwrap();
+                    *v += 1;
+                })
+                .unwrap();
+            }
+            let finished = pool.wait_until_done();
+            assert_eq!(finished, 8);
+        }
+        // by now the thread pool has shut down
+        let value = counter.lock().unwrap();
+        assert_eq!(*value, 8);
     }
 }
