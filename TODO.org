@@ -7,7 +7,8 @@
 | zip           |  12557798 | 0m1.458s  |
 | tar.zst       |   8852419 | 0m0.379s  |
 | pack-rs       |   8843264 | 0m7.728s  |
-| pack-rs tpool |   8839168 | 0m0.997s  |
+| pack-rs mem   |   8843264 | 0m0.641s  |
+| pack-rs tpool |   8839168 | 0m6.331s  |
 | Pack          |   8691712 | 0m0.244s  |
 | tar.bz2       |   7540345 | 0m4.948s  |
 | tar.xz        |   6464092 | 0m16.243s |
@@ -19,6 +20,7 @@
 | apparent size | 1420319384 | ---       |
 | zip           |  297273354 | 0m41.645s |
 | pack-rs       |  218058752 | 3m32.025s |
+| pack-rs mem   |  218034176 | 2m43.335s |
 | tar.zst       |  216776407 | 0m7.536s  |
 | tar.bz2       |  176093102 | 2m22.274s |
 | tar.xz        |  144296084 | 9m51.828s |
@@ -29,6 +31,27 @@
 | compressed    | 641073152 |
 ** DONE test with the C++98 tutorial PDF
 ** DONE process content bundles concurrently
+** TODO packing is very slow
+*** timing of =insert_content()= on httpd with 3 contents
+**** release mode, best of 3 runs, overall time =0m8.053s=
+**** 92% of time is allocating the =content= rows with =ZeroBlob=
+| description           | time (ms) |
+|-----------------------+-----------|
+| reading/compressing   |       186 |
+| reading/compressing   |       148 |
+| creating content      |      2243 |
+| writing content       |        32 |
+| inserting itemcontent |        18 |
+| creating content      |      4583 |
+| writing content       |        60 |
+| inserting itemcontent |        21 |
+| reading/compressing   |        99 |
+| creating content      |        12 |
+| writing content       |        10 |
+| inserting itemcontent |        16 |
+*** SQLite blob insert is very slow (when database exists on secondary storage)
+** TODO pack the archive concurrently
+*** currently not making good use of multiple cores
 ** TODO unpack the archive concurrently
 *** if total file size is known in advance, could use fallocate
 **** c.f. https://gist.github.com/jdidion/3e47a83a0047f4291c1beb2f3a179a3f

@@ -1,6 +1,19 @@
 # pack-rs
 
-An on-going effort to make something like [Pack](https://pack.ac) using [Rust](https://www.rust-lang.org). Pack is an archiver/compressor that takes a novel approach to the problem that has largely been dominated by two formats for the past couple of decades, tar/gz and zip. Original idea by [O](https://github.com/OttoCoddo) with an implementation in [Pascal](https://github.com/PackOrganization/Pack) and some very clever SQL.
+An experiment to make something like [Pack](https://pack.ac) using [Rust](https://www.rust-lang.org). Pack is an archiver/compressor that takes a novel approach to the problem that has largely been dominated by two formats for the past couple of decades, tar/gz and zip. Original idea by [O](https://github.com/OttoCoddo) with an implementation in [Pascal](https://github.com/PackOrganization/Pack) and some very clever SQL.
+
+## Current Status
+
+When writing to a database file on secondary storage, the majority of the running time (~90%) is spent in the allocation of the blob in SQLite using this statement:
+
+```rust
+conn.execute(
+    "INSERT INTO content (value) VALUES (?1)",
+    [ZeroBlob(compressed_len as i32)],
+)?;
+```
+
+For now, the program creates an in-memory database and writes to disk when completely finished. Even then, this program can be much slower than other archivers. This was an interesting project and maybe someone else can learn from it.
 
 ## Objectives
 
@@ -132,11 +145,12 @@ Like any solution to a complex problem, this design involves certain tradeoffs.
 
 ### Pros
 
-* The original [Pack](https://pack.ac), and hopefully this one too, are very fast and produce fairly small archives.
+* The original [Pack](https://pack.ac) is very fast and produces fairly small archives.
 * The container format, [SQLite](https://www.sqlite.org) is small, fast, and reliable.
 * By virtue of using a database, accessing individual file content is very fast.
 
 ### Cons
 
+* Depending on your library for SQLite, the blob allocation is painfully slow.
 * Not well suited to very small data sets. The overhead of the database will outweigh anything less than about 20 KB.
 * Streaming input and output, a la tar or gzip, is not feasible with this design.
