@@ -1,63 +1,11 @@
 * Action Items
-** DONE test with Apache HTTPD 2.4.59 source
-*** pack-rs runs use a ~release~ build
-| description   | byte size | time      |
-|---------------+-----------+-----------|
-| apparent size |  42873125 | ---       |
-| zip           |  12557798 | 0m1.458s  |
-| tar.zst       |   8852419 | 0m0.379s  |
-| pack-rs       |   8843264 | 0m7.728s  |
-| pack-rs mem   |   8843264 | 0m0.641s  |
-| pack-rs tpool |   8839168 | 0m6.331s  |
-| Pack          |   8691712 | 0m0.244s  |
-| tar.bz2       |   7540345 | 0m4.948s  |
-| tar.xz        |   6464092 | 0m16.243s |
-** DONE test with Linux 6.8.6 source
-*** times are the lowest value of 3 runs
-*** tests that took several minutes were run only once
-| description   |       size | time      |
-|---------------+------------+-----------|
-| apparent size | 1420319384 | ---       |
-| zip           |  297273354 | 0m41.645s |
-| pack-rs       |  218058752 | 3m32.025s |
-| pack-rs mem   |  218034176 | 2m43.335s |
-| tar.zst       |  216776407 | 0m7.536s  |
-| tar.bz2       |  176093102 | 2m22.274s |
-| tar.xz        |  144296084 | 9m51.828s |
-** DONE test with RocksDB database; works
-| description   |      size |
-|---------------+-----------|
-| apparent size | 912619651 |
-| compressed    | 641073152 |
-** DONE test with the C++98 tutorial PDF
-** DONE process content bundles concurrently
-** TODO packing is very slow
-*** timing of =insert_content()= on httpd with 3 contents
-**** release mode, best of 3 runs, overall time =0m8.053s=
-**** 92% of time is allocating the =content= rows with =ZeroBlob=
-| description           | time (ms) |
-|-----------------------+-----------|
-| reading/compressing   |       186 |
-| reading/compressing   |       148 |
-| creating content      |      2243 |
-| writing content       |        32 |
-| inserting itemcontent |        18 |
-| creating content      |      4583 |
-| writing content       |        60 |
-| inserting itemcontent |        21 |
-| reading/compressing   |        99 |
-| creating content      |        12 |
-| writing content       |        10 |
-| inserting itemcontent |        16 |
-*** SQLite blob insert is very slow (when database exists on secondary storage)
 ** TODO pack the archive concurrently
-*** currently not making good use of multiple cores
+*** currently not making any use of multiple cores
+*** previous attempt showed some improvement, but the threadpool was buggy
 ** TODO unpack the archive concurrently
 *** if total file size is known in advance, could use fallocate
 **** c.f. https://gist.github.com/jdidion/3e47a83a0047f4291c1beb2f3a179a3f
 *** otherwise, can wrap =File= in an =Arc<Mutex>= and manage using that
-** TODO test on Windows and update prerequisites
-** TODO test on RockyLinux 9 and provide install instructions
 ** TODO improve error handling
 *** avoid the generic ~No such file or directory~ error
 *** specifying files/folders that do not exist
@@ -65,7 +13,6 @@
 ** TODO size content bundles dynamically
 *** based on the number of incoming files (is what Pack does)
 *** will need to experiment with different data sets to find appropriate sizes
-** TODO consider the zstandard tuning that Pack does, maybe it helps
 ** TODO set database page size according to size of input set
 *** if more than =1mb=, page size is =4096=, otherwise =512= (is what Pack does)
 *** add a =new_with_page_size()= function or similar
@@ -75,7 +22,6 @@
 *** add column to =content= table that indicates the compression algorithm, or =none=
 **** the =zstd= crate lacks an API for detecting if data is compressed or not
 **** having an algorithm label allows for different compression algorithms
-** TODO validate the pack file when opening
 ** TODO add files to an existing archive
 *** should look up the full path and ensure parents exist
 *** if an existing entry matches the full path, create a new ~content~ row and replace its ~itemcontent~ rows
@@ -84,13 +30,7 @@
 **** remove any ~itemcontent~ rows for this particular item
 **** add new ~itemcontent~ rows for this new file
 ** TODO remove files from an existing archive
-** TODO collect statistics when building archive and report
-*** hide behind a =--verbose= global option
-- directories processed
-- files processed
-- total bytes read
-- total compressed size
-** TODO consider how to encrypt file data and/or metadata
+** TODO consider how to encrypt file data and metadata
 ** TODO support includes/excludes when building archive
 ** TODO support includes/excludes when extracting archive
 ** TODO optionally store file times, owners, permissions in separate table
@@ -123,3 +63,31 @@
 - empty files
 - empty directories
 - files larger than blob size
+* Benchmarks
+** Apache HTTPD 2.4.59 source
+*** Ubuntu 22.04 VM, 8 Xeon X5550 2.67 GHz cores, 8 GB RAM, HDD
+| description   | byte size | time      |
+|---------------+-----------+-----------|
+| apparent size |  42873125 | ---       |
+| zip           |  12557798 | 0m1.458s  |
+| tar.zst       |   8852419 | 0m0.379s  |
+| pack-rs       |   8843264 | 0m0.529s  |
+| Pack          |   8691712 | 0m0.244s  |
+| tar.bz2       |   7540345 | 0m4.948s  |
+| tar.xz        |   6464092 | 0m16.243s |
+** Linux 6.8.6 source
+*** Ubuntu 22.04 VM, 8 Xeon X5550 2.67 GHz cores, 8 GB RAM, HDD
+*** the very slow tests were run only one time
+| description   |       size | time      |
+|---------------+------------+-----------|
+| apparent size | 1420319384 | ---       |
+| zip           |  297273354 | 0m41.645s |
+| pack-rs       |  218034176 | 0m13.757s |
+| tar.zst       |  216776407 | 0m7.536s  |
+| tar.bz2       |  176093102 | 2m22.274s |
+| tar.xz        |  144296084 | 9m51.828s |
+** a large RocksDB database
+| description   |      size |
+|---------------+-----------|
+| apparent size | 912619651 |
+| compressed    | 641073152 |

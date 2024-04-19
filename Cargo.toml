@@ -12,6 +12,11 @@ license = "MIT"
 [dependencies]
 clap = "4.5.4"
 os_str_bytes = { version = "7.0.0", features = ["conversions"] }
-rusqlite = { version = "0.31.0", features = ["backup", "blob"] }
 thiserror = "1.0.58"
 zstd = "0.13.1"
+
+[target.'cfg(unix)'.dependencies]
+rusqlite = { version = "0.31.0", features = ["backup", "blob"] }
+
+[target.'cfg(windows)'.dependencies]
+rusqlite = { version = "0.31.0", features = ["backup", "blob", "bundled"] }

@@ -3,7 +3,6 @@
 //
 use clap::{arg, Command};
 use pack_rs::Error;
-use rusqlite::blob::ZeroBlob;
 use rusqlite::{Connection, DatabaseName};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -80,6 +79,8 @@ struct PackBuilder {
     current_pos: u64,
     // item content that will reside in the bundle under construction
     contents: Vec<IncomingContent>,
+    // workspace for compressing the content bundles
+    buffer: Option<Vec<u8>>,
 }
 
 impl PackBuilder {
@@ -95,6 +96,7 @@ impl PackBuilder {
             conn,
             current_pos: 0,
             contents: vec![],
+            buffer: None,
         })
     }
 
@@ -265,19 +267,15 @@ impl PackBuilder {
     // creates the necessary rows in the `itemcontent` table to map the file
     // data to the content bundle.
     //
-    fn insert_content(&self) -> Result<(), Error> {
-        // Set bundle capacity to some estimate of expected size with half of
-        // the total size being a rough estimate, since the file data will be
-        // compressed on the way in; worst case the vector will reallocate to
-        // twice the size two times instead of many times.
-        let total_size: Option<u64> = self
-            .contents
-            .iter()
-            .map(|e| e.size)
-            .reduce(|acc, e| acc + e);
-        let mut content: Vec<u8> = match total_size {
-            Some(size) => Vec::with_capacity((size / 2) as usize),
-            None => Vec::new(),
+    fn insert_content(&mut self) -> Result<(), Error> {
+        // Allocate a buffer for the compressed data, reusing it each time. For
+        // small data sets this makes no observable difference, but for any
+        // large data set (e.g. Linux kernel), it makes a huge difference.
+        let mut content: Vec<u8> = if let Some(mut buf) = self.buffer.take() {
+            buf.clear();
+            buf
+        } else {
+            Vec::with_capacity(BUNDLE_SIZE as usize)
         };
         let mut encoder = zstd::stream::write::Encoder::new(content, 0)?;
 
@@ -299,11 +297,12 @@ impl PackBuilder {
         // create space for the blob by inserting a zeroblob and then
         // overwriting it with the compressed content bundle
         //
-        // NOTE: This insert takes the majority of the overall running time.
+        // NOTE: This insert takes the majority of the overall running time when
+        // writing directly to disk.
         //
         self.conn.execute(
-            "INSERT INTO content (value) VALUES (?1)",
-            [ZeroBlob(compressed_len as i32)],
+            "INSERT INTO content (value) VALUES (ZEROBLOB(?1))",
+            [compressed_len as i32],
         )?;
         let content_id = self.conn.last_insert_rowid();
         let mut blob =
@@ -313,6 +312,7 @@ impl PackBuilder {
         if bytes_written != content.len() {
             return Err(Error::IncompleteBlobWrite);
         }
+        self.buffer = Some(content);
 
         // iterate through the item contents and insert new itemcontent rows
         for item in self.contents.iter() {

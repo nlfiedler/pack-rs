@@ -2,39 +2,9 @@
 
 An experiment to make something like [Pack](https://pack.ac) using [Rust](https://www.rust-lang.org). Pack is an archiver/compressor that takes a novel approach to the problem that has largely been dominated by two formats for the past couple of decades, tar/gz and zip. Original idea by [O](https://github.com/OttoCoddo) with an implementation in [Pascal](https://github.com/PackOrganization/Pack) and some very clever SQL.
 
-## Current Status
+## Status
 
-When writing to a database file on secondary storage, the majority of the running time (~90%) is spent in the allocation of the blob in SQLite using this statement:
-
-```rust
-conn.execute(
-    "INSERT INTO content (value) VALUES (?1)",
-    [ZeroBlob(compressed_len as i32)],
-)?;
-```
-
-For now, the program creates an in-memory database and writes to disk when completely finished. Even then, this program can be much slower than other archivers. This was an interesting project and maybe someone else can learn from it.
-
-## Objectives
-
-Build both a Rust crate and a binary that can be used to produce fairly small archives of a collection of files. The crate will have an interface similar to that of the [tar](https://crates.io/crates/tar) crate.
-
-Short term features:
-
-* Build an archive concurrently using multiple threads; same for extract.
-* Size the content bundles dynamically based on the incoming data size.
-* Set the database page size dynamically based on the incoming data size.
-* Extract a single file from an archive.
-* Add a new file to an existing archive.
-* Remove a file from an archive.
-* Support include/exclude patterns when building or extracting an archive.
-
-In the long term, there are additional features that would be nice-to-have:
-
-* Optional compression of a pack using any available algorithm, not just Zstandard. Currently, the Rust `zstd` crate lacks a nice way of detecting if a block of data is compressed using Zstandard. What's more, it would be ideal to future-proof the design by allowing an implementation to use any compression algorithm. Likely would add a `TEXT` column to the `content` table that specifies the compression algorithm used (e.g. `7zip`).
-* Support encryption of the content blobs (will require compression, probably involve a salt value stored in the `content` table).
-* Optionally store file metadata (owners, permissions, etc) in a separate table.
-* Optionally store file extended attributes in a separate table.
+This was an experiment, and a very interesting one at that. If and when the original Pack has a specification, and other people take an interest in it, then I would be more than happy to continue working on this project. All of the objectives that I had in mind are written in the `TODO.org` file (an emacs [org-mode](https://orgmode.org) file), including building a Rust crate with an API similar to that of [tar](https://crates.io/crates/tar).
 
 ## Build and Run
 
@@ -43,12 +13,14 @@ In the long term, there are additional features that would be nice-to-have:
 * [Rust](https://www.rust-lang.org) 2021 edition
 * C/C++ toolchain:
     - macOS: [Clang](https://clang.llvm.org) probably?
+    - RockyLinux: `sudo yum install gcc-c++ make`
     - Ubuntu: `sudo apt-get install build-essential`
-    - Windows: MSVC probably
+    - Windows: [MSVC](https://visualstudio.microsoft.com/visual-cpp-build-tools/) build tools and Windows SDK
 * SQLite 3 library:
     - macOS: `brew install sqlite`
+    - RockyLinux: `sudo yum install sqlite-devel`
     - Ubuntu: `sudo apt-get install libsqlite3-dev`
-    - Windows: TBD
+    - Windows: _it will be bundled with rusqlite_
 
 ### Running the tests
 
@@ -100,7 +72,7 @@ A pack file is an [SQLite](https://www.sqlite.org) database with file data store
 
 ### item
 
-Rows in the `item` table represent both directories, files, and symbolic links. The `kind` for files is `0`, the `kind` for directories is `1`, and the `kind` for symbolic links is `2`. The `name` is the final part of the file path, such as `README.md` or `src`. The `parent` refers to the directory that contains this entry on the file system, with `0` indicating the entry is at the "root" of the archive.
+Rows in the `item` table represent directories, files, and symbolic links. The `kind` for files is `0`, the `kind` for directories is `1`, and the `kind` for symbolic links is `2`. The `name` is the final part of the file path, such as `README.md` or `src`. The `parent` refers to the directory that contains this entry on the file system, with `0` indicating the entry is at the "root" of the archive.
 
 | Name     | Type                  | Description        |
 | -------- | --------------------- | ------------------ |
@@ -139,18 +111,15 @@ Empty files will have a row in the `itemcontent` table with a `size` of zero to 
 | `contentpos` | `INTEGER`             | position within the chunk from the `content` table for this chunk |
 | `size`       | `INTEGER`             | the size of the chunk |
 
-## Pros and Cons
+## Performance Considerations
 
-Like any solution to a complex problem, this design involves certain tradeoffs.
+When writing to a database file on secondary storage, the majority of the running time (~90%) is spent in the allocation of the blob in SQLite using this statement:
 
-### Pros
+```rust
+conn.execute(
+    "INSERT INTO content (value) VALUES (ZEROBLOB(?1))",
+    [compressed_len as i32],
+)?;
+```
 
-* The original [Pack](https://pack.ac) is very fast and produces fairly small archives.
-* The container format, [SQLite](https://www.sqlite.org) is small, fast, and reliable.
-* By virtue of using a database, accessing individual file content is very fast.
-
-### Cons
-
-* Depending on your library for SQLite, the blob allocation is painfully slow.
-* Not well suited to very small data sets. The overhead of the database will outweigh anything less than about 20 KB.
-* Streaming input and output, a la tar or gzip, is not feasible with this design.
+This may be a limitation in the current API of the `rusqlite` crate, or due to my lack of expertise in the usage of SQLite. As a work-around, the program creates an in-memory database and writes to disk when finished.
