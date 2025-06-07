@@ -6,6 +6,8 @@ An experiment to make something like [Pack](https://pack.ac) using [Rust](https:
 
 This was an experiment, and a very interesting one at that. If and when the original Pack has a specification, and other people take an interest in it, then I would be more than happy to continue working on this project. All of the objectives that I had in mind are written in the `TODO.org` file (an emacs [org-mode](https://orgmode.org) file), including building a Rust crate with an API similar to that of [tar](https://crates.io/crates/tar).
 
+For an alternative archive file format, see my other project named [exaf-rs](https://github.com/nlfiedler/exaf-rs), which borrows some ideas from Pack to define a new format called EXAF (EXtensible Archive Format).
+
 ## Build and Run
 
 ### Prerequisites
