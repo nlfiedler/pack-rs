@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Nathan Fiedler
+// Copyright (c) 2026 Nathan Fiedler
 //
 use crate::util::{decode_link, sanitize_path, symlink_target_within_root, verify_within_root, write_link};
 use crate::{is_pack_file, Error, Kind};

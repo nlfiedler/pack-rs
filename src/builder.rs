@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Nathan Fiedler
+// Copyright (c) 2026 Nathan Fiedler
 //
 use crate::util::{get_file_name, read_link};
 use crate::{Error, Kind};

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Nathan Fiedler
+// Copyright (c) 2026 Nathan Fiedler
 //
 use crate::Error;
 use rusqlite::Connection;

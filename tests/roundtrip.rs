@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Nathan Fiedler
+// Copyright (c) 2026 Nathan Fiedler
 //
 use pack_rs::{Archive, Builder, Error};
 use std::fs;
