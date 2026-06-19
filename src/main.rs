@@ -108,6 +108,7 @@ impl PackBuilder {
     ///
     fn add_dir_all<P: AsRef<Path>>(&mut self, basepath: P) -> Result<u64, Error> {
         let mut file_count: u64 = 0;
+        // used as a stack (push/pop), so directories are visited depth-first
         let mut subdirs: Vec<(i64, PathBuf)> = Vec::new();
         subdirs.push((0, basepath.as_ref().to_path_buf()));
         while let Some((mut parent_id, currdir)) = subdirs.pop() {
@@ -183,11 +184,9 @@ impl PackBuilder {
             (&parent, KIND_FILE, &name),
         )?;
         let item_id = self.conn.last_insert_rowid();
-        let md = fs::metadata(path.as_ref());
-        let file_len = match md.as_ref() {
-            Ok(attr) => attr.len(),
-            Err(_) => 0,
-        };
+        // propagate metadata errors rather than silently archiving the file as
+        // empty, which would be silent data loss
+        let file_len = fs::metadata(path.as_ref())?.len();
         // empty files will result in an itemcontent row whose size is zero,
         // allowing for the extraction process to know to create an empty file
         // (otherwise it is difficult to tell from the available data)
@@ -196,21 +195,25 @@ impl PackBuilder {
         loop {
             if self.current_pos + size > BUNDLE_SIZE {
                 let remainder = BUNDLE_SIZE - self.current_pos;
-                // add a portion of the file to fill the bundle
-                let content = IncomingContent {
-                    path: path.as_ref().to_path_buf(),
-                    kind: KIND_FILE,
-                    item: item_id,
-                    itempos,
-                    contentpos: self.current_pos,
-                    size: remainder,
-                };
-                self.contents.push(content);
+                // only add a partial chunk when there is room left in the
+                // bundle; when the bundle is already full (remainder == 0) just
+                // flush it and retry, avoiding a spurious zero-size chunk
+                if remainder > 0 {
+                    let content = IncomingContent {
+                        path: path.as_ref().to_path_buf(),
+                        kind: KIND_FILE,
+                        item: item_id,
+                        itempos,
+                        contentpos: self.current_pos,
+                        size: remainder,
+                    };
+                    self.contents.push(content);
+                    size -= remainder;
+                    itempos += remainder;
+                }
                 // insert the content and itemcontent rows and start a new
                 // bundle, then continue with the current file
                 self.process_contents()?;
-                size -= remainder;
-                itempos += remainder;
             } else {
                 // the remainder of the file fits within this content bundle
                 let content = IncomingContent {
@@ -241,11 +244,10 @@ impl PackBuilder {
             (&parent, KIND_SYMLINK, &name),
         )?;
         let item_id = self.conn.last_insert_rowid();
-        let md = fs::symlink_metadata(path.as_ref());
-        let link_len = match md.as_ref() {
-            Ok(attr) => attr.len(),
-            Err(_) => 0,
-        };
+        // derive the size from the actual link bytes (rather than
+        // symlink_metadata) so it matches exactly what insert_content writes,
+        // and propagate errors instead of silently storing an empty link
+        let link_len = read_link(path.as_ref())?.len() as u64;
         // assume that the link value is relatively small and simply add it into
         // the current content bundle in whole
         let content = IncomingContent {
@@ -285,9 +287,24 @@ impl PackBuilder {
                 let mut input = fs::File::open(&item.path)?;
                 input.seek(SeekFrom::Start(item.itempos))?;
                 let mut chunk = input.take(item.size);
-                io::copy(&mut chunk, &mut encoder)?;
+                // the contentpos/size offsets recorded for every item in this
+                // bundle were computed during planning; if the file changed
+                // size since then, the copied length will not match and every
+                // following item in the bundle would be misaligned, so treat a
+                // short/long read as a hard error rather than silent corruption
+                let copied = io::copy(&mut chunk, &mut encoder)?;
+                if copied != item.size {
+                    return Err(Error::ContentSizeMismatch(
+                        item.path.to_string_lossy().into_owned(),
+                    ));
+                }
             } else if item.kind == KIND_SYMLINK {
                 let value = read_link(&item.path)?;
+                if value.len() as u64 != item.size {
+                    return Err(Error::ContentSizeMismatch(
+                        item.path.to_string_lossy().into_owned(),
+                    ));
+                }
                 encoder.write_all(&value)?;
             }
         }
@@ -387,13 +404,21 @@ fn read_link(path: &Path) -> Result<Vec<u8>, Error> {
 }
 
 ///
+/// Decode raw symbolic link bytes into a path for the current platform.
+///
+fn decode_link(contents: &[u8]) -> Result<PathBuf, Error> {
+    use os_str_bytes::OsStringBytes;
+    // this returns None if the bytes are not valid for this platform
+    let target =
+        std::ffi::OsString::from_io_vec(contents.to_owned()).ok_or(Error::LinkTextEncoding)?;
+    Ok(PathBuf::from(target))
+}
+
+///
 /// Create a symbolic link using the given raw bytes.
 ///
 fn write_link(contents: &[u8], filepath: &Path) -> Result<(), Error> {
-    use os_str_bytes::OsStringBytes;
-    // this may panic if the bytes are not valid for this platform
-    let target = std::ffi::OsString::from_io_vec(contents.to_owned())
-        .ok_or_else(|| Error::LinkTextEncoding)?;
+    let target = decode_link(contents)?;
     // cfg! macro will not work in this OS-specific import case
     {
         #[cfg(target_family = "unix")]
@@ -404,6 +429,19 @@ fn write_link(contents: &[u8], filepath: &Path) -> Result<(), Error> {
         fs::symlink(target, filepath)?;
         #[cfg(target_family = "windows")]
         fs::symlink_file(target, filepath)?;
+    }
+    Ok(())
+}
+
+///
+/// Verify that `relpath`, after resolving any symbolic links on disk, stays
+/// within `root`. Returns `Error::UnsafePath` if it escapes. The path must
+/// already exist on disk (it is canonicalized).
+///
+fn verify_within_root(root: &Path, relpath: &Path) -> Result<(), Error> {
+    let canon = relpath.canonicalize()?;
+    if !canon.starts_with(root) {
+        return Err(Error::UnsafePath(relpath.to_string_lossy().into_owned()));
     }
     Ok(())
 }
@@ -461,8 +499,11 @@ SELECT id, parent, kind, Path FROM FIT;";
 
     // Returns the number of files extracted.
     fn extract_all(&self) -> Result<u64, Error> {
+        // the destination root against which every extracted path is checked to
+        // prevent writing outside the current directory (e.g. via a symlink)
+        let root = std::env::current_dir()?.canonicalize()?;
         // ensure all of the directories are created, even empty ones
-        self.ensure_all_directories()?;
+        self.ensure_all_directories(&root)?;
         // create a temporary table for holding the items and their full paths;
         // start by dropping the table in case it was left behind from a
         // previous operation
@@ -496,7 +537,7 @@ SELECT id, parent, kind, Path FROM FIT;";
             if indexed_file.content != content_id {
                 // reached the end of the entries for this content
                 if !files.is_empty() {
-                    file_count += self.process_content(files)?;
+                    file_count += self.process_content(&root, files)?;
                 }
                 content_id = indexed_file.content;
                 files = vec![indexed_file];
@@ -507,7 +548,7 @@ SELECT id, parent, kind, Path FROM FIT;";
         }
         // make sure any remaining content is processed
         if !files.is_empty() {
-            file_count += self.process_content(files)?;
+            file_count += self.process_content(&root, files)?;
         }
 
         // clean up
@@ -517,7 +558,7 @@ SELECT id, parent, kind, Path FROM FIT;";
 
     // Ensure that all directories in the archive are created, even those that
     // do not contain any files.
-    fn ensure_all_directories(&self) -> Result<(), Error> {
+    fn ensure_all_directories(&self, root: &Path) -> Result<(), Error> {
         let query = "WITH RECURSIVE FIT AS (
     SELECT *, Name || IIF(Kind = 1, '/', '') AS Path FROM Item WHERE Parent = 0
     UNION ALL
@@ -530,13 +571,16 @@ SELECT Path FROM FIT WHERE Kind = 1;";
         while let Some(row) = rows.next()? {
             let path: String = row.get(0)?;
             let fpath = pack_rs::sanitize_path(path)?;
-            fs::create_dir_all(fpath)?;
+            fs::create_dir_all(&fpath)?;
+            // verify the directory did not resolve outside the root, which can
+            // happen if an ancestor on disk is a pre-existing symbolic link
+            verify_within_root(root, &fpath)?;
         }
         Ok(())
     }
 
     // Process a single content blob and all of the files it contains.
-    fn process_content(&self, files: Vec<IndexedFile>) -> Result<u64, Error> {
+    fn process_content(&self, root: &Path, files: Vec<IndexedFile>) -> Result<u64, Error> {
         assert!(!files.is_empty(), "expected files to be non-empty");
         let content_id = files[0].content;
 
@@ -555,25 +599,27 @@ SELECT Path FROM FIT WHERE Kind = 1;";
             // a root, prefix, parent-dir elements)
             let fpath = pack_rs::sanitize_path(&entry.path)?;
             if entry.kind == KIND_FILE {
+                // confirm the parent directory resolves within the root before
+                // creating the file, so that a pre-existing symlink in the
+                // destination cannot redirect the write outside the root
+                if let Some(parent) = fpath.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    verify_within_root(root, parent)?;
+                }
                 // make sure the file exists and is writable
                 let mut output = fs::OpenOptions::new()
                     .write(true)
                     .create(true)
                     .truncate(false)
                     .open(&fpath)?;
-                let file_len = fs::metadata(fpath)?.len();
-                if file_len == 0 {
-                    // just created a new file, count it
+                // count each file once, on its first chunk
+                if entry.itempos == 0 {
                     file_count += 1;
                 }
-                // if the file was an empty file, then we are already done here
+                // empty files have a single zero-size chunk; non-empty files may
+                // span several chunks written in ascending itempos order
                 if entry.size > 0 {
-                    // ensure the file has the appropriate length for writing this
-                    // content chunk into the file, extending it as necessary
-                    if file_len < entry.itempos {
-                        output.set_len(entry.itempos)?;
-                    }
-                    // seek to the correct position within the file for this chunk
+                    // seek to the correct position within the file for this
+                    // chunk; writing past the end zero-fills any gap
                     if entry.itempos > 0 {
                         output.seek(SeekFrom::Start(entry.itempos))?;
                     }
@@ -583,6 +629,9 @@ SELECT Path FROM FIT WHERE Kind = 1;";
                     let mut chunk = cursor.take(entry.size);
                     io::copy(&mut chunk, &mut output)?;
                 }
+                // set the length to exactly the end of this chunk, truncating
+                // any leftover bytes from a previously existing file at this path
+                output.set_len(entry.itempos + entry.size)?;
             } else if entry.kind == KIND_SYMLINK {
                 // use Cursor because that's seemingly easier than getting a slice
                 let mut cursor = std::io::Cursor::new(&buffer);
@@ -590,6 +639,15 @@ SELECT Path FROM FIT WHERE Kind = 1;";
                 let mut chunk = cursor.take(entry.size);
                 let mut raw_bytes: Vec<u8> = vec![];
                 chunk.read_to_end(&mut raw_bytes)?;
+                // reject links whose target would escape the destination tree,
+                // and confirm the link's own directory is within the root
+                let target = decode_link(&raw_bytes)?;
+                if !pack_rs::symlink_target_within_root(&fpath, &target) {
+                    return Err(Error::UnsafePath(fpath.to_string_lossy().into_owned()));
+                }
+                if let Some(parent) = fpath.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    verify_within_root(root, parent)?;
+                }
                 write_link(&raw_bytes, &fpath)?;
             }
         }
@@ -628,8 +686,10 @@ SELECT Path FROM FIT WHERE Kind = 1;";
     // returns 0 if file not found
     #[allow(dead_code)]
     fn find_file_by_path(&self, relpath: &str) -> Result<i64, Error> {
-        let sql = format!(
-            "WITH RECURSIVE IT AS (
+        // bind the path as a parameter rather than interpolating it into the
+        // SQL text to avoid any possibility of SQL injection
+        let abs_path = format!("/{}", relpath);
+        let sql = "WITH RECURSIVE IT AS (
     SELECT Item.*, ID AS FID FROM Item WHERE
     ID IN (
         WITH RECURSIVE FIT AS (
@@ -637,20 +697,18 @@ SELECT Path FROM FIT WHERE Kind = 1;";
             UNION ALL
             SELECT Item.*, FIT.Path || Item.Name || IIF(Item.Kind = 1, '/', '') AS Path
                 FROM Item INNER JOIN FIT ON FIT.Kind = 1 AND Item.Parent = FIT.ID
-                WHERE '/{}' LIKE (Path || '%')
+                WHERE ?1 LIKE (Path || '%')
         )
-        SELECT ID FROM FIT WHERE Path IN ('/{}')
+        SELECT ID FROM FIT WHERE Path IN (?1)
     )
     UNION ALL
     SELECT Item.*, IT.FID FROM Item INNER JOIN IT ON IT.Kind = 1 AND Item.Parent = IT.ID
 ),
 ITI AS (SELECT (ROW_NUMBER() OVER (ORDER BY FID, ID) - 1) AS I, * FROM IT)
 SELECT C.I, IFNULL(P.I, -1) AS PI, C.ID, C.Parent, C.Kind, C.Name FROM ITI AS C
-LEFT JOIN ITI AS P ON C.FID = P.FID AND C.Parent = P.ID ORDER BY C.I;",
-            relpath, relpath
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut item_iter = stmt.query_map([], |row| {
+LEFT JOIN ITI AS P ON C.FID = P.FID AND C.Parent = P.ID ORDER BY C.I;";
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut item_iter = stmt.query_map([&abs_path], |row| {
             Ok(Entry {
                 id: row.get(2)?,
                 parent: row.get(3)?,

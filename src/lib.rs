@@ -32,6 +32,12 @@ pub enum Error {
     /// Thread pool is shutting down
     #[error("thread pool is shutting down")]
     ThreadPoolShutdown,
+    /// A file shrank or grew between planning and writing the archive.
+    #[error("file size changed while building archive: {0}")]
+    ContentSizeMismatch(String),
+    /// An archive entry would be extracted outside the destination directory.
+    #[error("refusing to extract entry outside destination: {0}")]
+    UnsafePath(String),
 }
 
 // Expected SQLite database header: "SQLite format 3\0"
@@ -82,6 +88,47 @@ pub fn sanitize_path<P: AsRef<Path>>(dirty: P) -> Result<PathBuf, Error> {
     Ok(path)
 }
 
+///
+/// Return `true` if the symbolic link `target` stays within the destination
+/// directory when resolved relative to the link's own location, `false`
+/// otherwise.
+///
+/// `link_path` is the link's (already sanitized) path relative to the
+/// destination root. Resolution is purely lexical so that it is not fooled by
+/// other symbolic links on the filesystem. Absolute targets, and relative
+/// targets that climb above the root via `..`, are rejected.
+///
+pub fn symlink_target_within_root<P: AsRef<Path>>(link_path: P, target: P) -> bool {
+    if target.as_ref().is_absolute() {
+        return false;
+    }
+    // depth of the directory containing the link, relative to the root
+    let mut depth: i64 = link_path
+        .as_ref()
+        .parent()
+        .map(|p| {
+            p.components()
+                .filter(|c| matches!(c, Component::Normal(_)))
+                .count() as i64
+        })
+        .unwrap_or(0);
+    for component in target.as_ref().components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            // a root or prefix component means the target escapes the tree
+            _ => return false,
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +160,23 @@ mod tests {
         let result = sanitize_path(Path::new("/usr/../src/./lib.rs"))?;
         assert_eq!(result, PathBuf::from("usr/src/lib.rs"));
         Ok(())
+    }
+
+    #[test]
+    fn test_symlink_target_within_root() {
+        // simple relative targets that stay inside the tree
+        assert!(symlink_target_within_root("link", "target"));
+        assert!(symlink_target_within_root("dir/link", "target"));
+        assert!(symlink_target_within_root("dir/link", "../sibling"));
+        assert!(symlink_target_within_root("a/b/link", "../../top"));
+        assert!(symlink_target_within_root("dir/link", "./nested/file"));
+
+        // targets that climb above the root are rejected
+        assert!(!symlink_target_within_root("link", ".."));
+        assert!(!symlink_target_within_root("dir/link", "../.."));
+        assert!(!symlink_target_within_root("a/b/link", "../../../escape"));
+
+        // absolute targets are always rejected
+        assert!(!symlink_target_within_root("link", "/etc/passwd"));
     }
 }
