@@ -20,8 +20,7 @@ WITH RECURSIVE FIT AS (
 )
 SELECT id, parent, kind, Path FROM FIT;
 
-
--- select items row(s) by path(s)
+-- select items row(s) by path(s) -- ?1 and ?2 are two paths being queried, add/remove as needed
 -- result rows: <ignore>, <ignore>, rowid, parent, kind, name
 WITH RECURSIVE IT AS (
     SELECT Item.*, ID AS FID FROM Item WHERE
@@ -31,10 +30,10 @@ WITH RECURSIVE IT AS (
             UNION ALL
             SELECT Item.*, FIT.Path || Item.Name || IIF(Item.Kind = 1, '/', '') AS Path
                 FROM Item INNER JOIN FIT ON FIT.Kind = 1 AND Item.Parent = FIT.ID
-                WHERE '/arch/unix/Makefile.in' LIKE (Path || '%')
-                OR '/arch/win32/config.m4' LIKE (Path || '%') -- add a row like this for each addl path
+                WHERE ?1 LIKE (Path || '%')
+                OR ?2 LIKE (Path || '%') -- add a row like this for each addl path
         )
-        SELECT ID FROM FIT WHERE Path IN ('/arch/unix/Makefile.in', '/arch/win32/config.m4') -- add paths here
+        SELECT ID FROM FIT WHERE Path IN (?1, ?2) -- add ?3 and so on for more paths
     )
     UNION ALL
     SELECT Item.*, IT.FID FROM Item INNER JOIN IT ON IT.Kind = 1 AND Item.Parent = IT.ID

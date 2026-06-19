@@ -1,182 +1,43 @@
 //
 // Copyright (c) 2024 Nathan Fiedler
 //
-use rusqlite::Connection;
-use std::fs;
-use std::io::Read;
-use std::path::{Component, Path, PathBuf};
 
-///
-/// This type represents all possible errors that can occur within this crate.
-///
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    /// Error occurred during an I/O related operation.
-    #[error("I/O error: {0}")]
-    IOError(#[from] std::io::Error),
-    /// Error occurred during an SQL related operation.
-    #[error("SQL error: {0}")]
-    SQLError(#[from] rusqlite::Error),
-    /// When writing file content to a blob, the result was incomplete.
-    #[error("could not write entire file part to blob")]
-    IncompleteBlobWrite,
-    /// The named pack file was not one of ours.
-    #[error("pack file format not recognized")]
-    NotPackFile,
-    /// The symbolic link bytes were not decipherable.
-    #[error("symbolic link encoding was not recognized")]
-    LinkTextEncoding,
-    /// Something happened when operating on the database.
-    #[error("error resulting from database operation")]
-    Database,
-    /// Thread pool is shutting down
-    #[error("thread pool is shutting down")]
-    ThreadPoolShutdown,
-    /// A file shrank or grew between planning and writing the archive.
-    #[error("file size changed while building archive: {0}")]
-    ContentSizeMismatch(String),
-    /// An archive entry would be extracted outside the destination directory.
-    #[error("refusing to extract entry outside destination: {0}")]
-    UnsafePath(String),
-}
+//! `pack-rs` is an archiver/compressor that stores archives as
+//! [SQLite](https://www.sqlite.org) databases, with file data held in large
+//! blobs compressed using [Zstandard](http://facebook.github.io/zstd/).
+//!
+//! The API resembles that of the [`tar`](https://crates.io/crates/tar) crate:
+//! build an archive with a [`Builder`], and read or extract one with an
+//! [`Archive`].
+//!
+//! # Creating an archive
+//!
+//! ```no_run
+//! let mut builder = pack_rs::Builder::new()?;
+//! builder.append_dir_all("src")?;
+//! builder.finish("archive.db3")?;
+//! # Ok::<(), pack_rs::Error>(())
+//! ```
+//!
+//! # Reading and extracting an archive
+//!
+//! ```no_run
+//! let archive = pack_rs::Archive::open("archive.db3")?;
+//! for entry in archive.entries()? {
+//!     println!("{}", entry.path().display());
+//! }
+//! archive.unpack("./dest")?;
+//! # Ok::<(), pack_rs::Error>(())
+//! ```
 
-// Expected SQLite database header: "SQLite format 3\0"
-static SQL_HEADER: &[u8] = &[
-    0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00,
-];
+mod archive;
+mod builder;
+mod error;
+mod kind;
+mod util;
 
-///
-/// Return `true` if the path refers to a pack file, false otherwise.
-///
-pub fn is_pack_file<P: AsRef<Path>>(path: P) -> Result<bool, Error> {
-    let metadata = fs::metadata(path.as_ref())?;
-    if metadata.is_file() && metadata.len() > 16 {
-        let mut file = fs::File::open(path.as_ref())?;
-        let mut buffer = [0; 16];
-        file.read_exact(&mut buffer)?;
-        if buffer == SQL_HEADER {
-            // open and check for non-zero amount of data
-            let conn = Connection::open(path.as_ref())?;
-            match conn.prepare("SELECT * FROM item") {
-                Ok(mut stmt) => {
-                    let result = stmt.exists([])?;
-                    return Ok(result);
-                }
-                Err(_) => {
-                    return Ok(false);
-                }
-            };
-        }
-    }
-    Ok(false)
-}
-
-///
-/// Return a sanitized version of the path, with any non-normal components
-/// removed. Roots and prefixes are especially problematic for extracting an
-/// archive, so those are always removed. Note also that path components which
-/// refer to the parent directory will be stripped ("foo/../bar" will become
-/// "foo/bar").
-///
-pub fn sanitize_path<P: AsRef<Path>>(dirty: P) -> Result<PathBuf, Error> {
-    let components = dirty.as_ref().components();
-    let allowed = components.filter(|c| matches!(c, Component::Normal(_)));
-    let mut path = PathBuf::new();
-    for component in allowed {
-        path = path.join(component);
-    }
-    Ok(path)
-}
-
-///
-/// Return `true` if the symbolic link `target` stays within the destination
-/// directory when resolved relative to the link's own location, `false`
-/// otherwise.
-///
-/// `link_path` is the link's (already sanitized) path relative to the
-/// destination root. Resolution is purely lexical so that it is not fooled by
-/// other symbolic links on the filesystem. Absolute targets, and relative
-/// targets that climb above the root via `..`, are rejected.
-///
-pub fn symlink_target_within_root<P: AsRef<Path>>(link_path: P, target: P) -> bool {
-    if target.as_ref().is_absolute() {
-        return false;
-    }
-    // depth of the directory containing the link, relative to the root
-    let mut depth: i64 = link_path
-        .as_ref()
-        .parent()
-        .map(|p| {
-            p.components()
-                .filter(|c| matches!(c, Component::Normal(_)))
-                .count() as i64
-        })
-        .unwrap_or(0);
-    for component in target.as_ref().components() {
-        match component {
-            Component::Normal(_) => depth += 1,
-            Component::CurDir => {}
-            Component::ParentDir => {
-                depth -= 1;
-                if depth < 0 {
-                    return false;
-                }
-            }
-            // a root or prefix component means the target escapes the tree
-            _ => return false,
-        }
-    }
-    true
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_pack_file() -> Result<(), Error> {
-        assert!(!is_pack_file("test/fixtures/empty-file")?);
-        assert!(!is_pack_file("test/fixtures/notpack.db3")?);
-        assert!(is_pack_file("test/fixtures/pack.db3")?);
-        Ok(())
-    }
-
-    #[test]
-    fn test_sanitize_path() -> Result<(), Error> {
-        // need to use real paths for the canonicalize() call
-        #[cfg(target_family = "windows")]
-        {
-            let result = sanitize_path(Path::new("C:\\Windows"))?;
-            assert_eq!(result, PathBuf::from("Windows"));
-        }
-        #[cfg(target_family = "unix")]
-        {
-            let result = sanitize_path(Path::new("/etc"))?;
-            assert_eq!(result, PathBuf::from("etc"));
-        }
-        let result = sanitize_path(Path::new("src/lib.rs"))?;
-        assert_eq!(result, PathBuf::from("src/lib.rs"));
-
-        let result = sanitize_path(Path::new("/usr/../src/./lib.rs"))?;
-        assert_eq!(result, PathBuf::from("usr/src/lib.rs"));
-        Ok(())
-    }
-
-    #[test]
-    fn test_symlink_target_within_root() {
-        // simple relative targets that stay inside the tree
-        assert!(symlink_target_within_root("link", "target"));
-        assert!(symlink_target_within_root("dir/link", "target"));
-        assert!(symlink_target_within_root("dir/link", "../sibling"));
-        assert!(symlink_target_within_root("a/b/link", "../../top"));
-        assert!(symlink_target_within_root("dir/link", "./nested/file"));
-
-        // targets that climb above the root are rejected
-        assert!(!symlink_target_within_root("link", ".."));
-        assert!(!symlink_target_within_root("dir/link", "../.."));
-        assert!(!symlink_target_within_root("a/b/link", "../../../escape"));
-
-        // absolute targets are always rejected
-        assert!(!symlink_target_within_root("link", "/etc/passwd"));
-    }
-}
+pub use archive::{Archive, Entry};
+pub use builder::Builder;
+pub use error::Error;
+pub use kind::Kind;
+pub use util::{is_pack_file, sanitize_path, symlink_target_within_root};

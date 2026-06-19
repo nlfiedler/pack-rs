@@ -26,7 +26,7 @@ For an alternative archive file format, see my other project named [exaf-rs](htt
 
 ### Running the tests
 
-For the time being there are very few unit tests.
+Unit tests live alongside the modules and round-trip integration tests are in `tests/`.
 
 ```shell
 cargo test
@@ -65,6 +65,29 @@ $ cargo run -- extract pack.db3
 ...
 Extracted 3138 files from pack.db3
 ```
+
+## Library usage
+
+The crate exposes a [tar](https://crates.io/crates/tar)-like API. Build an archive with a `Builder` and read or extract one with an `Archive`:
+
+```rust
+use pack_rs::{Archive, Builder};
+
+// create an archive from a directory tree
+let mut builder = Builder::new()?;
+builder.append_dir_all("src")?;
+builder.finish("archive.db3")?;
+
+// list and extract an archive
+let archive = Archive::open("archive.db3")?;
+for entry in archive.entries()? {
+    println!("{}", entry.path().display());
+}
+archive.unpack("./dest")?;
+# Ok::<(), pack_rs::Error>(())
+```
+
+`Builder` also offers `append_file` / `append_path` and the `bundle_size` and `compression_level` options. Extraction is sandboxed to the destination directory: entries whose paths or symbolic-link targets would escape `dest` are refused.
 
 ## Specification
 
