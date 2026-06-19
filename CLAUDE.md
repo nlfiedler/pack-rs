@@ -51,8 +51,8 @@ queries in `doc/internal/queries.sql`):
 
 Two driving types in `src/main.rs`:
 
-- **`PackBuilder`** (write path) — walks the input tree breadth-first
-  (`add_dir_all`), accumulating `IncomingContent` entries until a bundle reaches
+- **`PackBuilder`** (write path) — walks the input tree depth-first
+  (`add_dir_all`, using a stack), accumulating `IncomingContent` entries until a bundle reaches
   `BUNDLE_SIZE`, then `insert_content` compresses the bundle and writes the
   `content` + `itemcontent` rows. Symlink targets are stored as raw bytes, like
   file content.
