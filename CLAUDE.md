@@ -72,11 +72,12 @@ queries in `doc/internal/queries.sql`):
 
 The two driving types:
 
-- **`Builder`** (`src/builder.rs`) — `append_dir_all` walks the input tree
-  depth-first (using a stack), accumulating `IncomingContent` entries until a
-  bundle reaches `bundle_size`, then `insert_content` compresses the bundle and
-  writes the `content` + `itemcontent` rows. `finish(dest)` backs the in-memory
-  db up to disk. Symlink targets are stored as raw bytes, like file content.
+- **`Builder`** (`src/builder.rs`) — `create(dest)` opens the destination file
+  and begins one transaction; `append_dir_all` walks the input tree depth-first
+  (using a stack), accumulating `IncomingContent` entries until a bundle reaches
+  `bundle_size`, then `insert_content` compresses the bundle and writes the
+  `content` + `itemcontent` rows directly to disk; `finish` commits. Symlink
+  targets are stored as raw bytes, like file content.
 - **`Archive`** (`src/archive.rs`) — `entries` lists paths via a recursive CTE;
   `unpack(dest)` builds a temporary `IndexedFiles` table joining item paths to
   `itemcontent`, then processes blobs in `content`/`contentpos` order so each
@@ -84,10 +85,13 @@ The two driving types:
 
 ### Key implementation notes
 
-- **In-memory then backup-to-disk.** `Builder::new` opens an in-memory SQLite
-  connection and `finish` calls `Connection::backup` to write it out. This is a
-  deliberate performance workaround: writing blobs directly to an on-disk
-  database spends ~90% of runtime in the `ZEROBLOB` allocation insert.
+- **Single-transaction direct-to-disk.** `Builder::create` opens the on-disk
+  database and issues `BEGIN`; the whole build is one transaction committed by
+  `finish`. This is the key write-performance lever: the naive version ran every
+  insert in autocommit, so each of the thousands of tiny `item`/`itemcontent`
+  inserts forced its own `fsync` (a benchmark showed ~85x slower than batching).
+  Durability is unchanged (`synchronous=FULL`). The compressed bundle is bound
+  directly as a blob parameter rather than via `ZEROBLOB` + incremental write.
 - **Extraction is destination-rooted and sandboxed.** `unpack(dest)`
   canonicalizes `dest` as the root and writes `root.join(sanitize_path(path))`;
   `verify_within_root` (parent canonicalization) and `symlink_target_within_root`

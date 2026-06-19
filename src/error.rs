@@ -13,9 +13,6 @@ pub enum Error {
     /// Error occurred during an SQL related operation.
     #[error("SQL error: {0}")]
     SQLError(#[from] rusqlite::Error),
-    /// When writing file content to a blob, the result was incomplete.
-    #[error("could not write entire file part to blob")]
-    IncompleteBlobWrite,
     /// The named pack file was not one of ours.
     #[error("pack file format not recognized")]
     NotPackFile,

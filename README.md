@@ -74,9 +74,9 @@ The crate exposes a [tar](https://crates.io/crates/tar)-like API. Build an archi
 use pack_rs::{Archive, Builder};
 
 // create an archive from a directory tree
-let mut builder = Builder::new()?;
+let mut builder = Builder::create("archive.db3")?;
 builder.append_dir_all("src")?;
-builder.finish("archive.db3")?;
+builder.finish()?;
 
 // list and extract an archive
 let archive = Archive::open("archive.db3")?;
@@ -138,13 +138,8 @@ Empty files will have a row in the `itemcontent` table with a `size` of zero to 
 
 ## Performance Considerations
 
-When writing to a database file on secondary storage, the majority of the running time (~90%) is spent in the allocation of the blob in SQLite using this statement:
+An earlier version of this program was very slow when writing the archive directly to a database file on secondary storage, and the cost appeared to be concentrated in the `ZEROBLOB` allocation used to size each content blob. The real cause turned out to be unrelated to that statement (and unrelated to `rusqlite`): every `execute()` ran in SQLite's autocommit mode, so each of the thousands of small `item` and `itemcontent` inserts was its own transaction with its own `fsync`. On rotational media those syncs dominated the run time.
 
-```rust
-conn.execute(
-    "INSERT INTO content (value) VALUES (ZEROBLOB(?1))",
-    [compressed_len as i32],
-)?;
-```
+The build now runs inside a single transaction (begun in `Builder::create`, committed in `Builder::finish`), which reduces the whole archive to a single commit. A quick benchmark on the httpd data set showed wrapping the inserts in one transaction roughly an 85x speedup, with no change to durability (`synchronous=FULL` is retained). With the inserts batched, writing directly to disk is as fast as the previous in-memory-then-`backup()` approach while using far less memory, so the in-memory step was removed.
 
-This may be a limitation in the current API of the `rusqlite` crate, or due to my lack of expertise in the usage of SQLite. As a work-around, the program creates an in-memory database and writes to disk when finished.
+The compressed bundle is also now bound directly as a blob parameter rather than via the `ZEROBLOB` + incremental-write idiom; since the data is already in memory, the streaming idiom only wrote the bytes twice.

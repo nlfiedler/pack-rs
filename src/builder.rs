@@ -3,7 +3,7 @@
 //
 use crate::util::{get_file_name, read_link};
 use crate::{Error, Kind};
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::{params, Connection};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -69,22 +69,24 @@ struct IncomingContent {
 }
 
 ///
-/// Builds an archive by appending files and directories, then writing the
-/// resulting pack file to disk.
+/// Builds an archive by appending files and directories.
 ///
-/// The archive is assembled in an in-memory SQLite database and only written to
-/// the destination path when [`Builder::finish`] is called; this avoids the
-/// substantial cost of allocating blobs in an on-disk database.
+/// The archive is written directly to the destination file given to
+/// [`Builder::create`]. The entire build runs inside a single SQLite
+/// transaction that is committed by [`Builder::finish`], so the many small row
+/// inserts incur a single commit rather than one synchronous commit per
+/// statement. If the `Builder` is dropped without calling `finish`, the
+/// transaction is rolled back and no archive is produced.
 ///
 /// ```no_run
-/// let mut builder = pack_rs::Builder::new()?;
+/// let mut builder = pack_rs::Builder::create("archive.db3")?;
 /// builder.append_dir_all("src")?;
-/// builder.finish("archive.db3")?;
+/// builder.finish()?;
 /// # Ok::<(), pack_rs::Error>(())
 /// ```
 ///
 pub struct Builder {
-    // database connection (in memory until finish)
+    // database connection to the destination file
     conn: Connection,
     // target size of a content bundle, in bytes
     bundle_size: u64,
@@ -100,13 +102,23 @@ pub struct Builder {
 
 impl Builder {
     ///
-    /// Construct a new `Builder` that assembles the archive entirely in memory.
+    /// Create a new `Builder` writing to the archive file at `dest`, replacing
+    /// any existing file at that path.
     ///
-    pub fn new() -> Result<Self, Error> {
-        let conn = Connection::open_in_memory()?;
+    /// The build proceeds inside a single transaction; call [`Builder::finish`]
+    /// to commit it.
+    ///
+    pub fn create<P: AsRef<Path>>(dest: P) -> Result<Self, Error> {
+        // start from a clean database file so this is a create, not an append
+        let _ = fs::remove_file(dest.as_ref());
+        let conn = Connection::open(dest.as_ref())?;
         // can set the page_size when creating the database, but not after
         // conn.pragma_update(None, "page_size", 512)?;
         create_tables(&conn)?;
+        // Build the whole archive inside one transaction. With the default
+        // (synchronous=FULL) durability this still commits/fsyncs only once at
+        // finish, instead of once per statement as autocommit would.
+        conn.execute_batch("BEGIN")?;
         Ok(Self {
             conn,
             bundle_size: DEFAULT_BUNDLE_SIZE,
@@ -200,13 +212,14 @@ impl Builder {
     }
 
     ///
-    /// Finish building the archive, writing it to the given destination path.
+    /// Finish building the archive, committing the transaction so the archive
+    /// file is complete. Consumes the builder.
     ///
-    pub fn finish<P: AsRef<Path>>(&mut self, dest: P) -> Result<(), Error> {
+    pub fn finish(mut self) -> Result<(), Error> {
         if !self.contents.is_empty() {
             self.process_contents()?;
         }
-        self.conn.backup(DatabaseName::Main, dest, None)?;
+        self.conn.execute_batch("COMMIT")?;
         Ok(())
     }
 
@@ -369,27 +382,16 @@ impl Builder {
             }
         }
         let content = encoder.finish()?;
-        let compressed_len = content.len();
 
-        // create space for the blob by inserting a zeroblob and then
-        // overwriting it with the compressed content bundle
-        //
-        // NOTE: This insert takes the majority of the overall running time when
-        // writing directly to disk.
-        //
+        // Bind the compressed bundle directly as a blob parameter. The data is
+        // already fully in memory, so the zeroblob + incremental-write idiom
+        // (which exists for streaming) would only write the bytes twice.
         self.conn.execute(
-            "INSERT INTO content (value) VALUES (ZEROBLOB(?1))",
-            [compressed_len as i32],
+            "INSERT INTO content (value) VALUES (?1)",
+            params![content],
         )?;
         let content_id = self.conn.last_insert_rowid();
-        let mut blob =
-            self.conn
-                .blob_open(DatabaseName::Main, "content", "value", content_id, false)?;
-        let bytes_written = blob.write(&content)?;
-        if bytes_written != content.len() {
-            return Err(Error::IncompleteBlobWrite);
-        }
-        drop(blob);
+        // reclaim the buffer for reuse on the next bundle
         self.buffer = Some(content);
 
         // iterate through the item contents and insert new itemcontent rows

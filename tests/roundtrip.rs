@@ -32,9 +32,9 @@ fn test_roundtrip() -> Result<(), Error> {
     let archive_path = src.path().join("archive.db3");
     {
         // a small bundle size forces big.bin to span multiple content blobs
-        let mut builder = Builder::new()?.bundle_size(1024);
+        let mut builder = Builder::create(&archive_path)?.bundle_size(1024);
         let count = builder.append_dir_all(&srcdir)?;
-        builder.finish(&archive_path)?;
+        builder.finish()?;
         // four regular files; the symlink is not counted
         assert_eq!(count, 4);
     }
@@ -71,9 +71,9 @@ fn test_unpack_rejects_escaping_symlink() -> Result<(), Error> {
 
     let archive_path = src.path().join("evil.db3");
     {
-        let mut builder = Builder::new()?;
+        let mut builder = Builder::create(&archive_path)?;
         builder.append_dir_all(&srcdir)?;
-        builder.finish(&archive_path)?;
+        builder.finish()?;
     }
 
     let out = tempfile::tempdir()?;

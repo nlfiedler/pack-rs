@@ -17,12 +17,12 @@ fn create_archive(pack: &str, inputs: Vec<&PathBuf>) -> Result<u64, Error> {
         Some(_) => path_ref,
         None => path_ref.with_extension("db3"),
     };
-    let mut builder = Builder::new()?;
+    let mut builder = Builder::create(path)?;
     let mut file_count: u64 = 0;
     for input in inputs {
         file_count += builder.append_path(input)?;
     }
-    builder.finish(path)?;
+    builder.finish()?;
     Ok(file_count)
 }
 

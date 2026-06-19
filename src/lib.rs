@@ -13,9 +13,9 @@
 //! # Creating an archive
 //!
 //! ```no_run
-//! let mut builder = pack_rs::Builder::new()?;
+//! let mut builder = pack_rs::Builder::create("archive.db3")?;
 //! builder.append_dir_all("src")?;
-//! builder.finish("archive.db3")?;
+//! builder.finish()?;
 //! # Ok::<(), pack_rs::Error>(())
 //! ```
 //!
