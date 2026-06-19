@@ -405,7 +405,7 @@ fn write_link(contents: &[u8], filepath: &Path) -> Result<(), Error> {
         #[cfg(target_family = "windows")]
         fs::symlink_file(target, filepath)?;
     }
-    return Ok(());
+    Ok(())
 }
 
 ///
@@ -476,7 +476,7 @@ SELECT id, parent, kind, Path FROM FIT;";
             LEFT JOIN itemcontent ON IndexedFiles.II = ItemContent.Item
             ORDER BY content, contentpos",
         )?;
-        let mut item_iter = stmt.query_map([], |row| {
+        let item_iter = stmt.query_map([], |row| {
             Ok(IndexedFile {
                 content: row.get(0)?,
                 contentpos: row.get(1)?,
@@ -491,7 +491,7 @@ SELECT id, parent, kind, Path FROM FIT;";
         let mut content_id: i64 = -1;
         let mut files: Vec<IndexedFile> = vec![];
         let mut file_count: u64 = 0;
-        while let Some(row_result) = item_iter.next() {
+        for row_result in item_iter {
             let indexed_file = row_result?;
             if indexed_file.content != content_id {
                 // reached the end of the entries for this content
@@ -559,6 +559,7 @@ SELECT Path FROM FIT WHERE Kind = 1;";
                 let mut output = fs::OpenOptions::new()
                     .write(true)
                     .create(true)
+                    .truncate(false)
                     .open(&fpath)?;
                 let file_len = fs::metadata(fpath)?.len();
                 if file_len == 0 {
@@ -649,7 +650,7 @@ LEFT JOIN ITI AS P ON C.FID = P.FID AND C.Parent = P.ID ORDER BY C.I;",
             relpath, relpath
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let item_iter = stmt.query_map([], |row| {
+        let mut item_iter = stmt.query_map([], |row| {
             Ok(Entry {
                 id: row.get(2)?,
                 parent: row.get(3)?,
@@ -657,7 +658,7 @@ LEFT JOIN ITI AS P ON C.FID = P.FID AND C.Parent = P.ID ORDER BY C.I;",
                 name: row.get(5)?,
             })
         })?;
-        for entry in item_iter {
+        if let Some(entry) = item_iter.next() {
             return Ok(entry?.id);
         }
         Ok(0)
