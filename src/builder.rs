@@ -394,20 +394,22 @@ impl Builder {
         // reclaim the buffer for reuse on the next bundle
         self.buffer = Some(content);
 
-        // iterate through the item contents and insert new itemcontent rows
+        // iterate through the item contents and insert new itemcontent rows.
+        // The u64 offsets/sizes are cast to i64 because SQLite (and rusqlite,
+        // as of 0.40) only handle signed 64-bit integers.
         for item in self.contents.iter() {
             // create the mapping for this bit of content
             self.conn.execute(
                 "INSERT INTO itemcontent (
                     item, itempos, content, contentpos, size
                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                (
-                    &item.item,
-                    &item.itempos,
-                    &content_id,
-                    &item.contentpos,
-                    &item.size,
-                ),
+                params![
+                    item.item,
+                    item.itempos as i64,
+                    content_id,
+                    item.contentpos as i64,
+                    item.size as i64,
+                ],
             )?;
         }
 

@@ -3,7 +3,7 @@
 //
 use crate::util::{decode_link, sanitize_path, symlink_target_within_root, verify_within_root, write_link};
 use crate::{is_pack_file, Error, Kind};
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::Connection;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -149,11 +149,13 @@ SELECT kind, Path FROM FIT;";
             ORDER BY content, contentpos",
         )?;
         let item_iter = stmt.query_map([], |row| {
+            // SQLite stores these as signed 64-bit integers; rusqlite no longer
+            // converts to u64 implicitly, so read as i64 and cast
             Ok(IndexedFile {
                 content: row.get(0)?,
-                contentpos: row.get(1)?,
-                itempos: row.get(2)?,
-                size: row.get(3)?,
+                contentpos: row.get::<_, i64>(1)? as u64,
+                itempos: row.get::<_, i64>(2)? as u64,
+                size: row.get::<_, i64>(3)? as u64,
                 kind: row.get(4)?,
                 path: row.get(5)?,
             })
@@ -216,9 +218,9 @@ SELECT Path FROM FIT WHERE Kind = 1;";
         let content_id = files[0].content;
 
         // fetch the blob and decompress
-        let mut blob =
-            self.conn
-                .blob_open(DatabaseName::Main, "content", "value", content_id, true)?;
+        let mut blob = self
+            .conn
+            .blob_open("main", "content", "value", content_id, true)?;
         let mut buffer: Vec<u8> = Vec::new();
         zstd::stream::copy_decode(&mut blob, &mut buffer)?;
         drop(blob);

@@ -10,16 +10,16 @@ keywords = ["archiver", "compressor"]
 license = "MIT"
 
 [dependencies]
-clap = "4.5.4"
-os_str_bytes = { version = "7.0.0", features = ["conversions"] }
-thiserror = "1.0.58"
-zstd = "0.13.1"
+clap = "4.6"
+os_str_bytes = { version = "7.2", features = ["conversions"] }
+thiserror = "2.0"
+zstd = "0.13"
 
 [target.'cfg(unix)'.dependencies]
-rusqlite = { version = "0.31.0", features = ["backup", "blob"] }
+rusqlite = { version = "0.40", features = ["blob"] }
 
 [target.'cfg(windows)'.dependencies]
-rusqlite = { version = "0.31.0", features = ["backup", "blob", "bundled"] }
+rusqlite = { version = "0.40", features = ["blob", "bundled"] }
 
 [dev-dependencies]
-tempfile = "3.10"
+tempfile = "3"
