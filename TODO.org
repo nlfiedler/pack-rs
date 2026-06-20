@@ -1,18 +1,9 @@
 * Action Items
-** TODO pack the archive concurrently
-*** currently not making any use of multiple cores
-*** previous attempt showed some improvement, but the threadpool was buggy
-** TODO unpack the archive concurrently
-*** if total file size is known in advance, could use fallocate
-**** c.f. https://gist.github.com/jdidion/3e47a83a0047f4291c1beb2f3a179a3f
-*** otherwise, can wrap =File= in an =Arc<Mutex>= and manage using that
+** TODO investigate if the complex SQL can be streamlined at all
 ** TODO improve error handling
 *** avoid the generic ~No such file or directory~ error
 *** specifying files/folders that do not exist
 *** specifying =pack= to list/extract when =pack.db3= exists should use that name
-** TODO size content bundles dynamically
-*** based on the number of incoming files (is what Pack does)
-*** will need to experiment with different data sets to find appropriate sizes
 ** TODO set database page size according to size of input set
 *** if more than =1mb=, page size is =4096=, otherwise =512= (is what Pack does)
 *** add a =new_with_page_size()= function or similar
@@ -56,25 +47,19 @@
 | item   | integer | foreign key to ~item~ table |
 | name   | text    | name of extended attribute  |
 | value  | blob    | extended attribute bytes    |
-** library development plan
-*** error reporting from task threads needs to percolate upward
-*** enable creating the database in memory for unit testing purposes
-*** test cases
-- empty files
-- empty directories
-- files larger than blob size
 * Benchmarks
-** Apache HTTPD 2.4.59 source
-*** Ubuntu 22.04 VM, 8 Xeon X5550 2.67 GHz cores, 8 GB RAM, HDD
-| description   | byte size | time      |
-|---------------+-----------+-----------|
-| apparent size |  42873125 | ---       |
-| zip           |  12557798 | 0m1.458s  |
-| tar.zst       |   8852419 | 0m0.379s  |
-| pack-rs       |   8843264 | 0m0.529s  |
-| Pack          |   8691712 | 0m0.244s  |
-| tar.bz2       |   7540345 | 0m4.948s  |
-| tar.xz        |   6464092 | 0m16.243s |
+** Linux 7.1 source
+*** apparent size (1,585,434,576) and file count (93,610)
+*** contains 99 symbolic links
+*** Ubuntu 24.04 VM, 4 Xeon E5-2697 v3 @ 2.60GHz, 8 GB RAM, HDD
+| description                  |       size | time      |
+|------------------------------+------------+-----------|
+| apparent size                | 1585434576 | ---       |
+| original tar.xz file         |  158304768 | ---       |
+| tar --zstd                   |  227714326 | 0m6.876s  |
+| multi-transaction, in-memory |  230588416 | 5m41.790s |
+| single-transaction, on-disk  |  230588416 | 0m13.989s |
+| updated dependencies         |  230588416 | 0m13.980s |
 ** Linux 6.8.6 source
 *** Ubuntu 22.04 VM, 8 Xeon X5550 2.67 GHz cores, 8 GB RAM, HDD
 *** the very slow tests were run only one time
@@ -86,8 +71,3 @@
 | tar.zst       |  216776407 | 0m7.536s  |
 | tar.bz2       |  176093102 | 2m22.274s |
 | tar.xz        |  144296084 | 9m51.828s |
-** a large RocksDB database
-| description   |      size |
-|---------------+-----------|
-| apparent size | 912619651 |
-| compressed    | 641073152 |
